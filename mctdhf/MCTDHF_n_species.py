@@ -114,6 +114,14 @@ class MCTDHF_n_species:
         
         return g_3, g_4, g_5
 
+    def _transpose_g(self, g):
+        """Transpose g integrals for indirect interactions.
+        
+        For 4D integrals: (1, 0, 3, 2) swaps particle 1 <-> particle 2.
+        Override in DVR subclass for 2D case.
+        """
+        return jnp.transpose(g, (1, 0, 3, 2))
+
     @partial(jit, static_argnums=0)
     def calculate_energy(self, t, y):
         """Calculate the total energy of the system at time t."""
@@ -145,7 +153,7 @@ class MCTDHF_n_species:
                     g_MO_dict[(s1, s2)] = g_4
                 elif (s2, s1) in self.g_dict:
                     # Indirect interaction (s2 -> s1)
-                    g_spatial_T = jnp.transpose(self.g_dict[(s2, s1)], (1, 0, 3, 2))
+                    g_spatial_T = self._transpose_g(self.g_dict[(s2, s1)])
                     _, g_4, _ = self.transform_g(
                         g_spatial_T, 
                         bs[s1], bs[s2]
@@ -314,7 +322,7 @@ class MCTDHF_n_species:
                 elif (s2, s1) in self.g_dict:
                     # Indirect interaction (s2 -> s1) using transposed spatial integrals
                     # to obtain mean-field on s1 correctly.
-                    g_spatial_T = jnp.transpose(self.g_dict[(s2, s1)], (1, 0, 3, 2))
+                    g_spatial_T = self._transpose_g(self.g_dict[(s2, s1)])
                     
                     g_3, g_4, g_5 = self.transform_g(
                         g_spatial_T, 
@@ -358,12 +366,14 @@ class MCTDHF_n_species:
                     
                     # Calculate (1-P) W = g_3 - g_5
                     diff_g = g_3 - g_5
-                    # Contract with d: F_{in} = sum_{qrs} (g3 - g5)_{iqrs} * d_{nqrs}
-                    term_g_k = contract("iqrs, nqrs -> in", diff_g, d_sk, backend="jax")
                     
-                    # Multiply by D_inv
-                    # Result_im = F_in * D_inv_nm
-                    term_g += contract("in, nm -> im", term_g_k, D_inv, backend="jax")
+                    # Contract in one step: D_inv @ d @ (g3 - g5)
+                    # D_inv: [i, n] -> np (using p for summation)
+                    # d_sk: [n, q, r, s] -> pqrs (using p for D_inv summation)
+                    # diff_g: [i, q, r, s] -> iqrs
+                    # Result: [i, n] -> in (orbital derivative)
+                    # "np, pqrs, iqrs -> in"
+                    term_g += contract("np, pqrs, iqrs -> in", D_inv, d_sk, diff_g, backend="jax")
             
             b_dot_s = term_h + term_g
             
@@ -374,13 +384,48 @@ class MCTDHF_n_species:
  
         # 6. Coefficient time derivative
         if self.imag_time:
-            # Shift E to 0? Or just -H C
-            E = self.dCI.calculate_energy(C, h_MO_list, g_MO_dict)
-            C_dot = -(sigma - E * C)
+            C_dot = -sigma
         else:
             C_dot = -1j * sigma
             
         return self._Cb_to_y(C_dot, b_dots)
+
+    @partial(jit, static_argnums=0)
+    def ortonorm_b(self, b):
+        """Gram-Schmidt orthonormalization of b."""
+        # Assuming S=I for now as typical in this code
+        for i in range(b.shape[1]):
+            orto_adjustment = 0
+            for j in range(0, i):
+                # <b_i|b_j> projection
+                overlap = contract("i,i", b[:, i].conj(), b[:, j], backend="jax")
+                orto_adjustment += b[:, j] * overlap
+
+            b = b.at[:, i].add(-orto_adjustment)
+            norm = jnp.sqrt(contract("i,i", b[:, i].conj(), b[:, i], backend="jax"))
+            b = b.at[:, i].divide(norm)
+        return b
+
+    @partial(jit, static_argnums=0)
+    def ortonorm_C(self, C):
+        """Gram-Schmidt orthonormalization of C."""
+        # Reshape to (states, dets) for GS across states
+        # C shape: (states, dets_alpha, dets_beta...)
+        original_shape = C.shape
+        states = C.shape[0]
+        C_flat = C.reshape(states, -1)
+        
+        for i in range(states):
+            orto_adjustment = 0
+            for j in range(0, i):
+                 overlap = contract("i,i", C_flat[i].conj(), C_flat[j], backend="jax")
+                 orto_adjustment += overlap * C_flat[j]
+
+            C_flat = C_flat.at[i].add(-orto_adjustment)
+            norm = jnp.sqrt(contract("i,i", C_flat[i].conj(), C_flat[i], backend="jax"))
+            C_flat = C_flat.at[i].divide(norm)
+            
+        return C_flat.reshape(original_shape)
 
     def integrate(
         self,
@@ -392,6 +437,19 @@ class MCTDHF_n_species:
         normalize=None,
     ):
         """Run the simulation."""
+        
+        # Validate bs_init_list shapes if provided
+        if bs_init_list is not None:
+            if len(bs_init_list) != self.num_species:
+                raise ValueError(
+                    f"bs_init_list must have {self.num_species} elements, got {len(bs_init_list)}"
+                )
+            for s, b in enumerate(bs_init_list):
+                expected_shape = (self.num_spatial_orbitals[s], self.num_mctdhf_orbitals[s])
+                if b.shape != expected_shape:
+                    raise ValueError(
+                        f"bs_init_list[{s}] has shape {b.shape}, expected {expected_shape}"
+                    )
         
         # Initialization
         if bs_init_list is None:
@@ -424,16 +482,59 @@ class MCTDHF_n_species:
             if normalize or self.imag_time:
                 C, bs = self._y_to_Cb(y)
                 # Normalize C
-                norm_C = jnp.linalg.norm(C)
-                C = C / norm_C
+                C = self.ortonorm_C(C)
                 # Orthonormalize bs
                 bs_new = []
                 for b in bs:
-                    u, _, vh = jnp.linalg.svd(b, full_matrices=False)
-                    bs_new.append(u @ vh)
+                    b_norm = self.ortonorm_b(b)
+                    bs_new.append(b_norm)
                 y = self._Cb_to_y(C, bs_new)
                 
             ts.append(t)
             ys.append(y)
             
         return ts, ys
+
+
+class MCTDHF_n_species_DVR(MCTDHF_n_species):
+    """MCTDHF_n_species variant for DVR basis.
+    
+    In the DVR basis, the 2-body integrals g are diagonal in spatial
+    coordinates, i.e. g is 2D with g_{ij} = g(x_i, x_j) instead of 4D.
+    """
+    
+    @partial(jit, static_argnums=0)
+    def transform_g(self, g, b_sigma, b_tau):
+        """Transform two-particle integrals for DVR basis.
+        
+        For DVR basis, g is diagonal: g_{ij} = g(x_i, x_j) (2D array).
+        
+        Args:
+            g: Spatial integrals g_{ij} (2D, diagonal in real space)
+            b_sigma: Orbitals for particle 1 (spatial, mo)
+            b_tau: Orbitals for particle 2 (spatial, mo)
+            
+        Returns:
+            g_3: Mean-field tensor for sigma (one spatial index, three MO indices)
+            g_4: Fully transformed MO integrals
+            g_5: Back-transformed mean-field tensor (projected W)
+        """
+        # Transform j (tau) and l->s (tau): g_{ij} -> g_{iqs}
+        # Note: For sinc basis, j and l share the same spatial index in g
+        g_2 = contract("jq, js, ij -> iqs", b_tau.conj(), b_tau, g, backend="jax")
+        
+        # Transform k->r (sigma) to add r index: g_{iqs} -> g_{iqrs}
+        # Note: For sinc basis, i and k share the same spatial index
+        g_3 = contract("ir, iqs -> iqrs", b_sigma, g_2, backend="jax")
+        
+        # Transform i (sigma): g_{iqrs} -> g_{pqrs}
+        g_4 = contract("ip, iqrs -> pqrs", b_sigma.conj(), g_3, backend="jax")
+        
+        # Back-transform i (sigma): g_{pqrs} -> g_{iqrs}
+        g_5 = contract("ip, pqrs -> iqrs", b_sigma, g_4, backend="jax")
+        
+        return g_3, g_4, g_5
+
+    def _transpose_g(self, g):
+        """Transpose g integrals for DVR basis (2D)."""
+        return jnp.transpose(g, (1, 0))

@@ -408,7 +408,7 @@ class MCTDHF:
         )
 
         # Alpha overlap uses b_alpha from each state
-        s_a = contract("ai,ki,kj,bj->abij", I_alpha, b1_alpha, b2_alpha, I_alpha, backend="jax")
+        s_a = contract("ai,ki,kj,bj->abij", I_alpha, b1_alpha.conj(), b2_alpha, I_alpha, backend="jax")
         s_a = s_a[
             jnp.nonzero(s_a, size=(self.num_alpha_dets * self.num_alpha_electrons) ** 2)
         ]
@@ -418,7 +418,7 @@ class MCTDHF:
 
         if self.num_beta_electrons == self.num_alpha_electrons:
             # Beta overlap uses b_beta from each state
-            s_b = contract("ai,ki,kj,bj->abij", I_alpha, b1_beta, b2_beta, I_alpha, backend="jax")
+            s_b = contract("ai,ki,kj,bj->abij", I_alpha, b1_beta.conj(), b2_beta, I_alpha, backend="jax")
             s_b = s_b[
                 jnp.nonzero(s_b, size=(self.num_alpha_dets * self.num_alpha_electrons) ** 2)
             ]
@@ -432,7 +432,7 @@ class MCTDHF:
         )
 
         # Beta overlap uses b_beta from each state
-        s_b = contract("ai,ki,kj,bj->abij", I_beta, b1_beta, b2_beta, I_beta, backend="jax")
+        s_b = contract("ai,ki,kj,bj->abij", I_beta, b1_beta.conj(), b2_beta, I_beta, backend="jax")
         s_b = s_b[
             jnp.nonzero(s_b, size=(self.num_beta_dets * self.num_beta_electrons) ** 2)
         ]
@@ -457,10 +457,10 @@ class MCTDHF:
         D_alpha, D_beta = self.dCI.get_1p_RDMs_spin(C)
         
         # Alpha contribution: transform D_alpha using b_alpha
-        rho_alpha = contract("ix,in,snm,jm,jx->sx", spf, b_alpha, D_alpha, b_alpha, spf)
+        rho_alpha = contract("ix,in,snm,jm,jx->sx", spf, b_alpha.conj(), D_alpha, b_alpha, spf)
         
         # Beta contribution: transform D_beta using b_beta
-        rho_beta = contract("ix,in,snm,jm,jx->sx", spf, b_beta, D_beta, b_beta, spf)
+        rho_beta = contract("ix,in,snm,jm,jx->sx", spf, b_beta.conj(), D_beta, b_beta, spf)
         
         return rho_alpha + rho_beta
 
@@ -508,7 +508,11 @@ class MCTDHF:
 
 
 class MCTDHF_sinc(MCTDHF):
-    """MCTDHF variant for sinc-DVR basis."""
+    """MCTDHF variant for sinc-DVR basis.
+    
+    In the sinc-DVR basis, the 2-body integrals g are diagonal in spatial
+    coordinates, i.e. g is 2D with g_{ij} = g(x_i, x_j) instead of 4D.
+    """
     
     @partial(jit, static_argnums=0)
     def transform_g(self, g, b, bc):
@@ -520,9 +524,10 @@ class MCTDHF_sinc(MCTDHF):
         return g_3, g_4, g_5
 
     @partial(jit, static_argnums=0)
-    def transform_g_spin_sinc(self, g, b_sigma, b_tau, bc_sigma, bc_tau):
+    def transform_g_spin(self, g, b_sigma, b_tau, bc_sigma, bc_tau):
         """Transform g with spin indices for sinc basis (physicist notation).
         
+        Overrides parent to handle 2D g integrals.
         Particle 1 (i,k) uses sigma, particle 2 (j,l) uses tau.
         For sinc basis, g is diagonal: g_ij = g(x_i, x_j).
         """
@@ -538,22 +543,4 @@ class MCTDHF_sinc(MCTDHF):
         # Back-transform
         g_5 = contract("ip, pqrs -> iqrs", b_sigma, g_4, backend="jax")
         return g_3, g_4, g_5
-
-    @partial(jit, static_argnums=0)
-    def get_E(self, t, b_alpha, b_beta, C):
-        """Calculate energy for sinc basis."""
-        bc_alpha = b_alpha.conj()
-        bc_beta = b_beta.conj()
-
-        h_alpha = self.h_alpha + self.ht_alpha(t)
-        h_beta = self.h_beta + self.ht_beta(t)
-
-        _, h_2_alpha, _ = self.transform_h(h_alpha, b_alpha, bc_alpha)
-        _, h_2_beta, _ = self.transform_h(h_beta, b_beta, bc_beta)
-
-        _, g_aa_4, _ = self.transform_g_spin_sinc(self.g, b_alpha, b_alpha, bc_alpha, bc_alpha)
-        _, g_ab_4, _ = self.transform_g_spin_sinc(self.g, b_alpha, b_beta, bc_alpha, bc_beta)
-        _, g_bb_4, _ = self.transform_g_spin_sinc(self.g, b_beta, b_beta, bc_beta, bc_beta)
-
-        return self.dCI.calculate_energy(C, h_2_alpha, h_2_beta, g_aa_4, g_ab_4, g_bb_4)
 

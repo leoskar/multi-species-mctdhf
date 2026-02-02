@@ -168,16 +168,20 @@ class SemiDirectCI_n_species:
         # Iterate over all pairs (s1, s2)
         # We assume g_dict has keys for all valid interactions
         for (s1, s2), g_int in g_dict.items():
-            factor = 0.5 
             if s1 == s2:
-                # Intra-species
+                # Intra-species: factor 0.5 (double counting in sum)
+                factor = 0.5 
                 term = self._contract_2body_intra(C, g_int, s1)
             else:
-                # Inter-species
-                # Note: factor 0.5 is usually for double summing s1!=s2. 
-                # If g_ab and g_ba are both present and equal, we sum both with 0.5.
+                # Inter-species: check if BOTH orderings are in g_dict
+                # If both (s1,s2) and (s2,s1) are present, use factor 0.5 to avoid double counting
+                # If only one is present, use factor 1.0 (to account for missing symmetric term)
+                if (s2, s1) in g_dict:
+                    factor = 0.5  # Both orderings present, avoid double counting
+                else:
+                    factor = 1.0  # Only one ordering, need full contribution
                 term = self._contract_2body_inter(C, g_int, s1, s2)
-                
+            
             sigma = sigma + factor * term
             
         return sigma
@@ -407,7 +411,15 @@ class SemiDirectCI_n_species:
             
         # 2-body energy
         for (s1, s2), g in element_g.items():
-            factor = 0.5
+            # Same factor logic as get_sigma
+            if s1 == s2:
+                factor = 0.5  # Intra-species: avoid double counting
+            else:
+                # Check if both orderings are present
+                if (s2, s1) in element_g:
+                    factor = 0.5  # Both orderings present
+                else:
+                    factor = 1.0  # Only one ordering
             d = ds[(s1, s2)]
             # Contract g * d
             # Both are (p,q,r,s) tensors, d has batch
