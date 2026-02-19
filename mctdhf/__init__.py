@@ -5,3 +5,4 @@ from .MCTDHF_direct_jax import *
 from .integrators import *
 from .SemiDirectCI_n_species import *
 from .MCTDHF_n_species import *
+from .sine_dvr import *

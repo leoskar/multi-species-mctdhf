@@ -427,6 +427,241 @@ class MCTDHF_n_species:
             
         return C_flat.reshape(original_shape)
 
+    def compute_subsystem_character(self, C):
+        """Compute subsystem excitation character for each state.
+        
+        Returns a matrix of shape (num_states, num_species) where each entry
+        indicates the "average excitation level" of that subsystem for that state.
+        For each state s and species k, this is computed as the weighted average
+        of the orbital index: sum_n n * D[s,n,n] where D is the 1-particle RDM.
+        
+        Higher values indicate higher excitation levels in that subsystem.
+        """
+        Ds = self.dCI.get_1p_RDMs(C)  # List of (num_states, n_orb, n_orb)
+        
+        num_states = C.shape[0]
+        character = jnp.zeros((num_states, self.num_species))
+        
+        for s in range(self.num_species):
+            D_s = Ds[s]  # (num_states, n_orb, n_orb)
+            n_orb = D_s.shape[-1]
+            # Compute average orbital index (excitation level)
+            # orbital_weight[n] = n (0 = ground, 1 = first excited, etc.)
+            orbital_weights = jnp.arange(n_orb, dtype=jnp.float32)
+            # D[state, n, n] is the occupation of orbital n in that state
+            for state_idx in range(num_states):
+                diag = jnp.diag(D_s[state_idx])  # Orbital occupations
+                # Weighted average of orbital index
+                avg_orbital = jnp.sum(orbital_weights * jnp.abs(diag)) / jnp.sum(jnp.abs(diag))
+                character = character.at[state_idx, s].set(avg_orbital)
+        
+        return character
+
+    def localize_states(self, y, energy_tol=1e-6, max_sweeps=20, tol=1e-8, verbose=False):
+        """Localize degenerate states to Hartree products (post-processing).
+        
+        States are ordered by energy. Within degenerate subspaces (energies 
+        within energy_tol), states are rotated to maximize subsystem purities,
+        producing localized product-like states instead of entangled superpositions.
+        
+        Uses Jacobi rotations with analytically computed optimal angles based
+        on subsystem purity Tr(ρ_s²) as the localization metric.
+        
+        Parameters
+        ----------
+        y : array
+            The packed state vector from ITE.
+        energy_tol : float
+            Energy tolerance for grouping degenerate states.
+        max_sweeps : int
+            Maximum number of Jacobi sweeps per degenerate subspace.
+        tol : float
+            Convergence tolerance for rotation angles (radians).
+        verbose : bool
+            If True, print progress information.
+            
+        Returns
+        -------
+        y_localized : array
+            Packed state vector with localized states, ordered by energy.
+        character : array
+            Subsystem character matrix (num_states, num_species).
+        """
+        C, bs = self._y_to_Cb(y)
+        num_states = C.shape[0]
+        
+        if num_states <= 1:
+            character = self.compute_subsystem_character(C)
+            return y, character
+        
+        # --- Step 1: Compute per-state energies and sort ---
+        energies = jnp.real(self.calculate_energy(0.0, y))
+        energy_order = jnp.argsort(energies)
+        C = C[energy_order]
+        energies = energies[energy_order]
+        
+        if verbose:
+            print(f"  State energies: {[f'{e:.6f}' for e in energies]}")
+        
+        # --- Step 2: Group degenerate states ---
+        groups = []
+        current_group = [0]
+        for i in range(1, num_states):
+            if jnp.abs(energies[i] - energies[current_group[0]]) < energy_tol:
+                current_group.append(i)
+            else:
+                groups.append(current_group)
+                current_group = [i]
+        groups.append(current_group)
+        
+        if verbose:
+            for g_idx, group in enumerate(groups):
+                E_avg = float(jnp.mean(energies[jnp.array(group)]))
+                print(f"  Group {g_idx}: states {group}, E ≈ {E_avg:.6f}, size={len(group)}")
+        
+        # --- Step 3: Localize within each degenerate subspace ---
+        C_shape = C.shape
+        
+        for group in groups:
+            if len(group) <= 1:
+                continue
+            
+            group_indices = jnp.array(group)
+            C_sub = C[group_indices]  # (group_size, n_det_0, ...)
+            n_sub = len(group)
+            
+            initial_purity = self._compute_total_purity(C_sub)
+            if verbose:
+                print(f"\n  Localizing group {group} (purity={initial_purity:.6f})...")
+            
+            # Jacobi sweeps
+            for sweep in range(max_sweeps):
+                max_rotation = 0.0
+                
+                for ii in range(n_sub):
+                    for jj in range(ii + 1, n_sub):
+                        # Compute optimal rotation angle analytically
+                        theta_opt = self._compute_optimal_angle(C_sub, ii, jj)
+                        
+                        if jnp.abs(theta_opt) > tol:
+                            max_rotation = max(max_rotation, float(jnp.abs(theta_opt)))
+                            
+                            # Apply rotation
+                            cos_t = jnp.cos(theta_opt)
+                            sin_t = jnp.sin(theta_opt)
+                            C_i_new = cos_t * C_sub[ii] + sin_t * C_sub[jj]
+                            C_j_new = -sin_t * C_sub[ii] + cos_t * C_sub[jj]
+                            C_sub = C_sub.at[ii].set(C_i_new)
+                            C_sub = C_sub.at[jj].set(C_j_new)
+                
+                if verbose:
+                    purity = self._compute_total_purity(C_sub)
+                    print(f"    Sweep {sweep+1}: max_rotation={max_rotation:.6f}, purity={purity:.6f}")
+                
+                if max_rotation < tol:
+                    if verbose:
+                        print(f"    Converged after {sweep+1} sweeps")
+                    break
+            
+            # Write back
+            C = C.at[group_indices].set(C_sub)
+            
+            if verbose:
+                final_purity = self._compute_total_purity(C_sub)
+                print(f"    Purity: {initial_purity:.6f} → {final_purity:.6f}")
+        
+        # --- Step 4: Return ---
+        y_localized = self._Cb_to_y(C, bs)
+        character = self.compute_subsystem_character(C)
+        
+        return y_localized, character
+    
+    def _compute_total_purity(self, C_sub):
+        """Compute total subsystem purity: Σ_α Σ_s Tr(ρ_s[α]²).
+        
+        For a Hartree product state, each purity = 1 (maximum).
+        For an entangled state, purity < 1.
+        """
+        n_sub = C_sub.shape[0]
+        total_purity = 0.0
+        
+        for alpha in range(n_sub):
+            for s in range(self.num_species):
+                rho_s = self._subsystem_rdm(C_sub[alpha], s)
+                total_purity += float(jnp.real(jnp.trace(rho_s @ rho_s)))
+        
+        return total_purity
+    
+    def _subsystem_rdm(self, C_single, s):
+        """Compute reduced density matrix of species s for a single state.
+        
+        ρ_s = Tr_{not s}(|ψ⟩⟨ψ|) in the CI determinant space.
+        
+        Parameters
+        ----------
+        C_single : array
+            CI tensor for a single state, shape (n_det_0, ..., n_det_{K-1}).
+        s : int
+            Species index.
+            
+        Returns
+        -------
+        rho : array
+            Reduced density matrix, shape (n_det_s, n_det_s).
+        """
+        # Move species s axis to front, flatten the rest
+        C_moved = jnp.moveaxis(C_single, s, 0)
+        n_det_s = C_moved.shape[0]
+        M = C_moved.reshape(n_det_s, -1)
+        
+        # ρ_s = M @ M†
+        rho = M @ M.conj().T
+        return rho
+    
+    def _compute_optimal_angle(self, C_sub, ii, jj):
+        """Compute optimal Jacobi rotation angle for states ii, jj.
+        
+        Maximizes total purity Σ_s [Tr(ρ'_s[i]²) + Tr(ρ'_s[j]²)]
+        using the analytical formula θ_opt = atan2(2E, D) / 4.
+        """
+        D_total = 0.0
+        E_total = 0.0
+        
+        for s in range(self.num_species):
+            # Compute subsystem density matrices and transition density
+            rho_i = self._subsystem_rdm(C_sub[ii], s)
+            rho_j = self._subsystem_rdm(C_sub[jj], s)
+            
+            # Transition density: T = M_i @ M_j†
+            C_i_moved = jnp.moveaxis(C_sub[ii], s, 0)
+            C_j_moved = jnp.moveaxis(C_sub[jj], s, 0)
+            n_det_s = C_i_moved.shape[0]
+            M_i = C_i_moved.reshape(n_det_s, -1)
+            M_j = C_j_moved.reshape(n_det_s, -1)
+            T = M_i @ M_j.conj().T
+            
+            # Symmetrized transition: R = T + T†
+            R = T + T.conj().T
+            
+            # Compute traces (all real for Hermitian matrices)
+            t_AA = jnp.real(jnp.trace(rho_i @ rho_i))
+            t_BB = jnp.real(jnp.trace(rho_j @ rho_j))
+            t_AB = jnp.real(jnp.trace(rho_i @ rho_j))
+            t_RR = jnp.real(jnp.trace(R @ R))
+            t_AR = jnp.real(jnp.trace(rho_i @ R))
+            t_BR = jnp.real(jnp.trace(rho_j @ R))
+            
+            D_s = t_AA + t_BB - t_RR - 2 * t_AB
+            E_s = t_AR - t_BR
+            
+            D_total += float(D_s)
+            E_total += float(E_s)
+        
+        # Analytical optimal angle
+        theta_opt = jnp.arctan2(2 * E_total, D_total) / 4
+        
+        return theta_opt
+
     def integrate(
         self,
         integrator,
@@ -472,27 +707,34 @@ class MCTDHF_n_species:
         t = t_init
         y = y_init
         
-        ts = [t]
-        ys = [y]
+        do_normalize = normalize or self.imag_time
         
-        for _ in range(num_steps):
+        def step_fn(carry, _):
+            t, y = carry
             t, y = integrator(t, y)
-             
-            # Normalization if required
-            if normalize or self.imag_time:
-                C, bs = self._y_to_Cb(y)
-                # Normalize C
-                C = self.ortonorm_C(C)
-                # Orthonormalize bs
-                bs_new = []
-                for b in bs:
-                    b_norm = self.ortonorm_b(b)
-                    bs_new.append(b_norm)
-                y = self._Cb_to_y(C, bs_new)
-                
-            ts.append(t)
-            ys.append(y)
             
+            if do_normalize:
+                C, bs = self._y_to_Cb(y)
+                C = self.ortonorm_C(C)
+                # Stack bs and vmap orthonormalization (assumes same shape)
+                # bs_stacked = jnp.stack(bs, axis=0)
+                # bs_stacked = jax.vmap(self.ortonorm_b)(bs_stacked)
+                # bs_new = [bs_stacked[s] for s in range(self.num_species)]
+
+                # In case the shapes are not the same, use a loop
+                bs_new = [self.ortonorm_b(b) for b in bs]
+                
+                y = self._Cb_to_y(C, bs_new)
+            
+            return (t, y), (t, y)
+        
+        init_carry = (t, y)
+        _, (ts_arr, ys_arr) = jax.lax.scan(step_fn, init_carry, None, length=num_steps)
+        
+        # Prepend initial values
+        ts = jnp.concatenate([jnp.array([t_init]), ts_arr])
+        ys = jnp.concatenate([y_init[None, :], ys_arr])
+        
         return ts, ys
 
 
