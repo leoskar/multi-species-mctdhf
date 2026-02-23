@@ -1,3 +1,15 @@
+"""Semi-Direct Configuration Interaction for N distinguishable species.
+
+Implements the Semi-Direct CI approach from Hochstuhl et al. for an arbitrary
+number of distinguishable particle species. Excitation operators (E_pq, E_pqrs)
+are precomputed as dense tensors at initialization, then contracted with the
+CI coefficient tensor at runtime via opt_einsum.
+
+Reference:
+    Hochstuhl, Bonitz — "Time-dependent multiconfiguration methods for the
+    numerical simulation of photoionization processes of many-electron atoms"
+"""
+
 import numpy as np
 from opt_einsum import contract
 from jax import jit
@@ -5,10 +17,29 @@ import jax.numpy as jnp
 from functools import partial
 from itertools import combinations
 
-class SemiDirectCI_n_species:
-    """Class for running SemiDirectCI calculations with N distinguishable species.
 
-    Generalizes the 2-species (alpha/beta) implementation to N species.
+class SemiDirectCI_n_species:
+    """Configuration Interaction solver for N distinguishable species.
+
+    Generalizes the 2-species (alpha/beta) implementation to N species,
+    each with its own set of Slater determinants and excitation operators.
+
+    Parameters
+    ----------
+    num_spatial_orbitals : int or list of int
+        Number of spatial (MCTDHF) orbitals per species. If a single int,
+        the same value is used for all species.
+    num_particles : list of int
+        Number of particles per species [N_0, N_1, ..., N_{K-1}].
+
+    Attributes
+    ----------
+    E_pq : list of jnp.ndarray
+        Single-excitation tensors E^(s)_{IJ,pq} for each species s.
+    E_pqrs : list of jnp.ndarray
+        Double-excitation tensors E^(s)_{IJ,pqrs} for each species s.
+    num_dets : list of int
+        Number of Slater determinants per species.
     """
 
     def __init__(
@@ -18,44 +49,52 @@ class SemiDirectCI_n_species:
     ):
         self.num_species = len(num_particles)
         self.num_particles = num_particles
-        
-        # Handle uniform or species-specific spatial orbitals
+
         if isinstance(num_spatial_orbitals, int):
             self.num_spatial_orbitals = [num_spatial_orbitals] * self.num_species
         else:
             self.num_spatial_orbitals = num_spatial_orbitals
-            
+
         assert len(self.num_spatial_orbitals) == self.num_species
-        
-        # Initialize storage for each species
-        self.I = []      # Slater determinants
-        self.W = []      # Address weights
+
+        # Precompute determinant data and excitation operators per species
+        self.I = []          # Slater determinants (boolean occupation vectors)
+        self.W = []          # Vertex weights for address computation
         self.num_dets = []
-        self.E_pq = []   # 1-body excitations [species]
-        self.E_pqrs = [] # 2-body excitations [species]
-        
+        self.E_pq = []       # 1-body excitation tensors
+        self.E_pqrs = []     # 2-body excitation tensors
+
         # Precompute data for each species
         for s in range(self.num_species):
             n_orb = self.num_spatial_orbitals[s]
             n_part = self.num_particles[s]
-            
+
             # Slater determinants
             I_s = self.get_slater_dets(n_orb, n_part)
             self.I.append(I_s)
             self.num_dets.append(I_s.shape[0])
-            
+
             # Address weights
             W_s = self.get_address_weights(n_orb, n_part)
             self.W.append(W_s)
-            
+
             # Excitation operators
             self.E_pq.append(self._calculate_Epq(n_orb, self.num_dets[s], I_s, W_s))
             self.E_pqrs.append(self._calculate_Epqrs(n_orb, self.num_dets[s], I_s, W_s))
 
+        # Convert to JAX arrays once — avoids repeated implicit transfers in
+        # JIT-compiled methods that use opt_einsum with backend="jax"
+        self.E_pq = [jnp.array(e) for e in self.E_pq]
+        self.E_pqrs = [jnp.array(e) for e in self.E_pqrs]
+
+    # ── Determinant enumeration and addressing ────────────────────────────
+
     @staticmethod
     def get_slater_dets(num_orbitals, num_electrons):
-        """Generate a list of all Slater determinants. Order agrees with the address function."""
-        # Reuse logic from original class
+        """Generate all Slater determinants as boolean occupation vectors.
+
+        The ordering agrees with the vertex-weight address function.
+        """
         dets = []
         if num_electrons == 0:
             dets.append(np.zeros(num_orbitals))
@@ -70,7 +109,10 @@ class SemiDirectCI_n_species:
 
     @staticmethod
     def get_address_weights(num_orbitals, num_electrons):
-        """Calculate node weights, see Fig. 19 and equation 3.70 in Hochstuhl et al."""
+        """Compute vertex weights for determinant addressing.
+
+        See Fig. 19 and Eq. 3.70 in Hochstuhl et al.
+        """
         W = np.zeros((num_orbitals + 1, num_electrons + 1))
         W[:, 0] = 1
         for m in range(1, num_orbitals + 1):
@@ -79,14 +121,19 @@ class SemiDirectCI_n_species:
         return W
 
     def address(self, n, num_spatial_orbitals, W):
-        """Use node weights to calculate address."""
+        """Map an occupation vector to its integer address via vertex weights."""
         res = 0
         for m in range(num_spatial_orbitals):
             res += n[m] * W[m, int(np.sum(n[: m + 1]))]
         return int(res)
 
+    # ── Second-quantized excitation evaluation ────────────────────────────
+
     def single_exc(self, p, q, n):
-        """Evaluate a single particle excitation a^+_pa_q."""
+        """Evaluate single excitation a†_p a_q on determinant n.
+
+        Returns (phase, new_det) or (0, 0) if the excitation is forbidden.
+        """
         n_pq = np.copy(n)
         n_pq[q] = 0
         if n_pq[p] == 1:
@@ -96,7 +143,10 @@ class SemiDirectCI_n_species:
         return gamma, n_pq
 
     def double_exc(self, p, q, s, r, n):
-        """Evaluate a two particle excitation a^+_pa^+_qa_sa_r."""
+        """Evaluate double excitation a†_p a†_q a_s a_r on determinant n.
+
+        Returns (phase, new_det) or (0, 0) if the excitation is forbidden.
+        """
         if s == r or p == q:
             return 0, 0
         n_pqsr = np.copy(n)
@@ -112,8 +162,10 @@ class SemiDirectCI_n_species:
         gamma += np.sum(n_pqsr[:p])
         return (-1) ** gamma, n_pqsr
 
+    # ── Excitation tensor construction (numpy, done once at init) ─────────
+
     def _calculate_Epq(self, num_spatial_orbitals, num_dets, spin_strings, W):
-        """Calculate matrix of single particle excitations."""
+        """Build the 1-body excitation tensor E_{IJ,pq}."""
         E_pq = np.zeros((num_dets,) * 2 + (num_spatial_orbitals,) * 2)
         for J in spin_strings:
             j = self.address(J, num_spatial_orbitals, W)
@@ -127,7 +179,7 @@ class SemiDirectCI_n_species:
         return E_pq
 
     def _calculate_Epqrs(self, num_spatial_orbitals, num_dets, spin_strings, W):
-        """Calculate matrix of two particle excitations."""
+        """Build the 2-body excitation tensor E_{IJ,pqrs}."""
         E_pqrs = np.zeros((num_dets,) * 2 + (num_spatial_orbitals,) * 4)
         for J in spin_strings:
             j = self.address(J, num_spatial_orbitals, W)
@@ -142,287 +194,217 @@ class SemiDirectCI_n_species:
                                 E_pqrs[i, j, p, q, r, s] += xi
         return E_pqrs
 
-    # --- JAX-Compatible Methods ---
+    # ── Einsum index helpers ──────────────────────────────────────────────
+
+    def _species_indices(self, s, out_char='x'):
+        """Build einsum index strings for contracting an operator on species s.
+
+        Returns
+        -------
+        c_str : str
+            Input CI index string, e.g. "abc" for 3 species.
+        out_str : str
+            Output CI index string with species s replaced by out_char.
+        op_str : str
+            Operator index string "{out_char}{in_char}".
+        """
+        c_indices = [chr(97 + i) for i in range(self.num_species)]
+        in_char = c_indices[s]
+        op_str = out_char + in_char
+        c_str = "".join(c_indices)
+        out_indices = list(c_indices)
+        out_indices[s] = out_char
+        out_str = "".join(out_indices)
+        return c_str, out_str, op_str
+
+    # ── JAX-compiled CI operations ────────────────────────────────────────
 
     @partial(jit, static_argnums=0)
     def get_sigma(self, C, h_list, g_dict):
-        """Calculate sigma = H|Psi> for N species.
-        
-        Args:
-            C: CI coefficients tensor (batch, n_dets_0, n_dets_1, ...)
-            h_list: List of 1-body integrals [h_0, h_1, ...]
-            g_dict: Dict of 2-body integrals {(s1,s2): g_tensor}
-            
-        Returns:
-            Sigma tensor of same shape as C.
+        """Compute σ = H|Ψ⟩ for N species.
+
+        Parameters
+        ----------
+        C : jnp.ndarray
+            CI coefficient tensor, shape (num_states, n_dets_0, n_dets_1, ...).
+        h_list : list of jnp.ndarray
+            Transformed 1-body integrals [h_0, h_1, ...], each (n_mo, n_mo).
+        g_dict : dict
+            Transformed 2-body integrals {(s1, s2): g_pqrs}.
+
+        Returns
+        -------
+        sigma : jnp.ndarray
+            Same shape as C.
         """
         sigma = jnp.zeros_like(C)
-        
-        # 1. One-body terms: sum_s H_s
+
+        # 1-body contributions
         for s in range(self.num_species):
             sigma = sigma + self._contract_1body(C, h_list[s], s)
-            
-        # 2. Two-body terms: 0.5 * sum_{s1, s2} V_{s1,s2}
-        # Note: g_dict contains transformed integrals g_{pqrs}
-        
-        # Iterate over all pairs (s1, s2)
-        # We assume g_dict has keys for all valid interactions
+
+        # 2-body contributions (with correct counting factors)
         for (s1, s2), g_int in g_dict.items():
             if s1 == s2:
                 # Intra-species: factor 0.5 (double counting in sum)
-                factor = 0.5 
+                factor = 0.5
                 term = self._contract_2body_intra(C, g_int, s1)
             else:
-                # Inter-species: check if BOTH orderings are in g_dict
-                # If both (s1,s2) and (s2,s1) are present, use factor 0.5 to avoid double counting
-                # If only one is present, use factor 1.0 (to account for missing symmetric term)
-                if (s2, s1) in g_dict:
-                    factor = 0.5  # Both orderings present, avoid double counting
-                else:
-                    factor = 1.0  # Only one ordering, need full contribution
+                # If both (s1,s2) and (s2,s1) present → 0.5 each; else → 1.0
+                factor = 0.5 if (s2, s1) in g_dict else 1.0
                 term = self._contract_2body_inter(C, g_int, s1, s2)
-            
             sigma = sigma + factor * term
-            
+
         return sigma
 
     def _contract_1body(self, C, h, s):
-        """Compute sigma contribution from 1-body operator on species s.
-        
-        Op: E_pq[s] * h_pq
-        Contraction: Sum_{p,q} Sum_{I_s} E_{J_s, I_s, p, q} * h_{p,q} * C_{..., I_s, ...}
-        
-        """
-        
-        # Build einsum string for contracting Species-specific operator with C
-        # C indices: a, b, c, ...
-        c_indices = [chr(97 + i) for i in range(self.num_species)]
-        
-        # E[s] indices: c'_s (output), c_s (input), p, q
-        # Use 'x' for output determinant index
-        target_idx_char = c_indices[s]
-        output_idx_char = 'x'
-        
-        # Contract E and h first: sigma_1body_op = E_{J,I,p,q} * h_{p,q} -> Op_{J,I}
+        """Contract 1-body operator h on species s with CI tensor C."""
+        c_str, out_str, op_str = self._species_indices(s)
+
+        # Pre-contract E_pq with h → operator matrix Op_{IJ}
         Op_s = contract("ijpq, pq -> ij", self.E_pq[s], h, backend="jax")
-        
-        # Now contract Op_s with C
-        op_str = output_idx_char + target_idx_char
-        c_str = "".join(c_indices)
-        
-        out_indices = list(c_indices)
-        out_indices[s] = output_idx_char
-        out_str = "".join(out_indices)
-        
-        # Equation: "ij, ...j... -> ...i..."
         einsum_str = f"{op_str},...{c_str}->...{out_str}"
-        
         return contract(einsum_str, Op_s, C, backend="jax")
 
     def _contract_2body_intra(self, C, g, s):
-        """Compute sigma contribution from intra-species 2-body operator."""
-        # E_pqrs[s]: [Out, In, p, q, r, s]
-        # g: [p, q, r, s]
-        
-        # Pre-contract E and g -> Op_{J,I}
+        """Contract intra-species 2-body operator g on species s with CI tensor C."""
+        c_str, out_str, op_str = self._species_indices(s)
+
+        # Pre-contract E_pqrs with g → operator matrix Op_{IJ}
         Op_s = contract("ijpqrs, pqrs -> ij", self.E_pqrs[s], g, backend="jax")
-        
-        # Contract with C (same as 1-body)
-        c_indices = [chr(97 + i) for i in range(self.num_species)]
-        target_idx_char = c_indices[s]
-        output_idx_char = 'x'
-        
-        op_str = output_idx_char + target_idx_char
-        c_str = "".join(c_indices)
-        out_indices = list(c_indices)
-        out_indices[s] = output_idx_char
-        out_str = "".join(out_indices)
-        
         einsum_str = f"{op_str},...{c_str}->...{out_str}"
         return contract(einsum_str, Op_s, C, backend="jax")
 
     def _contract_2body_inter(self, C, g, s1, s2):
-        """Compute sigma contribution from inter-species 2-body operator.
-        
-        Op = g_{pqrs} * E_{p,r}^(s1) * E_{q,s}^(s2)
-        Indices: g corresponds to <pq|rs>
-        """
-        
-        # 1. Contract g with E^(s1)
-        # E^(s1): [Out1, In1, p, r]
-        # g: [p, q, r, s]
-        # Result T1: [Out1, In1, q, s]
-        # "ijpr, pqrs -> ijqs"
+        """Contract inter-species 2-body operator g_{pqrs} E^(s1)_{pr} E^(s2)_{qs}."""
+        # Step 1: contract g with E^(s1)
         T1 = contract("ijpr, pqrs -> ijqs", self.E_pq[s1], g, backend="jax")
-        
-        # 2. Contract T1 with E^(s2)
-        # E^(s2): [Out2, In2, q, s]
-        # T1: [Out1, In1, q, s]
-        # Result Op_12: [Out1, In1, Out2, In2]
-        # "ijqs, klqs -> ijkl"
+
+        # Step 2: contract with E^(s2) → 4-index operator Op_{I1,J1,I2,J2}
         Op_12 = contract("ijqs, klqs -> ijkl", T1, self.E_pq[s2], backend="jax")
-        
-        # 3. Contract with C
-        # Op_12 indices: x (out1), y (in1), z (out2), w (in2)
-        # C indices: a, ..., y (at s1), ..., w (at s2), ...
-        # Output: a, ..., x (at s1), ..., z (at s2), ...
-        
+
+        # Step 3: contract with C
         c_indices = [chr(97 + i) for i in range(self.num_species)]
-        in1_char = c_indices[s1]
-        in2_char = c_indices[s2]
-        
-        out1_char = 'A'
-        out2_char = 'B'
-        
+        in1_char, in2_char = c_indices[s1], c_indices[s2]
+        out1_char, out2_char = 'A', 'B'
+
         op_str = out1_char + in1_char + out2_char + in2_char
         c_str = "".join(c_indices)
-        
         out_indices = list(c_indices)
         out_indices[s1] = out1_char
         out_indices[s2] = out2_char
         out_str = "".join(out_indices)
-        
+
         einsum_str = f"{op_str},...{c_str}->...{out_str}"
         return contract(einsum_str, Op_12, C, backend="jax")
 
+    # ── Reduced Density Matrices ──────────────────────────────────────────
+
+    def _compute_rho_ci(self, C, s):
+        """Compute the reduced CI density matrix for species s.
+
+        Contracts C* and C over all species indices except s, yielding
+        ρ^CI_{xy} = Σ_{other} C*_{...x...} C_{...y...}.
+
+        Returns shape (..., n_det_s, n_det_s) where ... is the batch dimension.
+        """
+        c_indices = [chr(97 + i) for i in range(self.num_species)]
+        c_conj_indices = list(c_indices)
+        c_conj_indices[s] = 'x'  # conjugate index
+        c_indices[s] = 'y'
+
+        rho_ci_str = f"...{''.join(c_conj_indices)},...{''.join(c_indices)}->...xy"
+        return contract(rho_ci_str, C.conj(), C, backend="jax")
+
     @partial(jit, static_argnums=0)
     def get_1p_RDMs(self, C):
-        """Calculate 1-particle RDMs for all species.
-        
-        Returns:
-            List of RDMs [D_0, D_1, ..., D_{N-1}]
-            D_s shape: (n_orb_s, n_orb_s)
+        """Compute 1-particle reduced density matrices for all species.
+
+        Returns
+        -------
+        list of jnp.ndarray
+            D_s of shape (num_states, n_orb_s, n_orb_s) for each species s.
+            D^(s)_{pq} = ⟨Ψ| E^(s)_{pq} |Ψ⟩.
         """
         Ds = []
         for s in range(self.num_species):
-            # Formula: D_{pq}^{(s)} = <Psi | E_{pq}^{(s)} | Psi>
-            # = Sum_{Out, In} E_{Out, In, p, q}^{(s)} * Rho_{In, Out}^{(s)}
-            # Where Rho_{In, Out}^{(s)} is the reduced density matrix of the CI vector
-            # obtained by tracing out all other species.
-            
-            # 1. Compute Reduced CI matrix Rho_CI^{(s)}_{In, Out}
-            # Contract C.conj() * C over all indices EXCEPT s
-            # C*: [a, ..., x (s), ...]
-            # C:  [a, ..., y (s), ...]
-            # Out: [x, y]
-            
-            c_indices = [chr(97 + i) for i in range(self.num_species)]
-            c_conj_indices = list(c_indices)
-            c_conj_indices[s] = 'x' # conjugage index for s
-            c_indices[s] = 'y'      # normal index for s
-            
-            c_conj_str = "".join(c_conj_indices)
-            c_str = "".join(c_indices)
-            
-            # Sum over all shared indices (all except x and y)
-            out_str = '...xy' # x=bra, y=ket, dots=batch
-            
-            rho_ci_str = f"...{c_conj_str},...{c_str}->{out_str}"
-            rho_ci = contract(rho_ci_str, C.conj(), C, backend="jax")
-            
-            # 2. Contract with E_{pq}^{(s)}
-            # E: [Out (x), In (y), p, q]
-            # Rho: [..., x, y] 
-            # Output: (batch, p, q)
-            
+            rho_ci = self._compute_rho_ci(C, s)
             D_s = contract("ijpq, ...ij -> ...pq", self.E_pq[s], rho_ci, backend="jax")
             Ds.append(D_s)
-            
         return Ds
 
     @partial(jit, static_argnums=0)
     def get_2p_RDMs(self, C):
-        """Calculate 2-particle RDMs for all species pairs.
-        
-        Returns:
-            Dict {(s1, s2): d_tensor}
+        """Compute 2-particle reduced density matrices for all species pairs.
+
+        Returns
+        -------
+        dict of {(s1, s2): jnp.ndarray}
+            d^(s1,s2)_{pqrs} = ⟨Ψ| E^(s1)_{pqrs} |Ψ⟩  (intra-species)
+            d^(s1,s2)_{pqrs} = ⟨Ψ| E^(s1)_{pr} E^(s2)_{qs} |Ψ⟩  (inter-species)
         """
         ds = {}
-        
-        # Loop over all pairs
+
         for s1 in range(self.num_species):
             for s2 in range(self.num_species):
                 if s1 == s2:
-                    # Intra-species 2-RDM
-                    # d_{pqrs} = <Psi | E_{pqrs} | Psi>
-                    # Similar to 1-RDM logic
-                    c_indices = [chr(97 + i) for i in range(self.num_species)]
-                    c_conj_indices = list(c_indices)
-                    c_conj_indices[s1] = 'x'
-                    c_indices[s1] = 'y'
-                    
-                    rho_ci = contract(
-                        f"...{''.join(c_conj_indices)},...{''.join(c_indices)}->...xy", 
-                        C.conj(), C, backend="jax"
+                    # Intra-species: reuse shared rho_ci helper
+                    rho_ci = self._compute_rho_ci(C, s1)
+                    d_intra = contract(
+                        "ijpqrs, ...ij -> ...pqrs",
+                        self.E_pqrs[s1], rho_ci, backend="jax"
                     )
-                    
-                    d_intra = contract("ijpqrs, ...ij -> ...pqrs", self.E_pqrs[s1], rho_ci, backend="jax")
                     ds[(s1, s1)] = d_intra
-                    
                 else:
-                    # Inter-species 2-RDM
-                    # d_{pqrs} = <Psi | E_{pr}^{(s1)} E_{qs}^{(s2)} | Psi>
-                    # Contract over all indices excep s1 and s2
-                    
+                    # Inter-species: contract over all indices except s1 and s2
                     idx_conj = [chr(97 + i) for i in range(self.num_species)]
                     idx_norm = [chr(97 + i) for i in range(self.num_species)]
-                    
-                    idx_conj[s1] = 'x' # s1 out
-                    idx_conj[s2] = 'z' # s2 out
-                    
-                    idx_norm[s1] = 'y' # s1 in
-                    idx_norm[s2] = 'w' # s2 in
-                    
-                    # Reduced Rho_CI for pair (s1, s2): indices [x, z, y, w] (out1, out2, in1, in2)
+                    idx_conj[s1], idx_conj[s2] = 'x', 'z'
+                    idx_norm[s1], idx_norm[s2] = 'y', 'w'
+
                     rho_pair_str = f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
                     rho_pair = contract(rho_pair_str, C.conj(), C, backend="jax")
-                    
-                    # Contract with Excitations
-                    # E1: [x, y, p, r]
-                    # E2: [z, w, q, s]
-                    # Rho: [..., x, z, y, w]
-                    
-                    # "xzyw, xypr, zwqs -> pqrs"
+
                     d_inter = contract(
-                        "...xzyw, xypr, zwqs -> ...pqrs", 
-                        rho_pair, 
-                        self.E_pq[s1], 
-                        self.E_pq[s2], 
+                        "...xzyw, xypr, zwqs -> ...pqrs",
+                        rho_pair, self.E_pq[s1], self.E_pq[s2],
                         backend="jax"
                     )
                     ds[(s1, s2)] = d_inter
-                    
+
         return ds
+
+    # ── Energy calculation ────────────────────────────────────────────────
 
     @partial(jit, static_argnums=0)
     def calculate_energy(self, C, element_h, element_g):
-        """Calculate energy given transformed integrals."""
-        # element_h: List [h0, h1, ...]
-        # element_g: Dict {(s1,s2): g}
-        
+        """Compute total energy from transformed integrals.
+
+        Parameters
+        ----------
+        C : jnp.ndarray
+            CI coefficients.
+        element_h : list of jnp.ndarray
+            Transformed 1-body integrals per species.
+        element_g : dict of {(s1, s2): jnp.ndarray}
+            Transformed 2-body integrals.
+        """
         Ds = self.get_1p_RDMs(C)
         ds = self.get_2p_RDMs(C)
-        
+
         E = 0.0
-        
-        # 1-body energy
+
+        # 1-body energy: Σ_s Tr(D_s · h_s)
         for s, h in enumerate(element_h):
             E += contract("...pq, pq -> ...", Ds[s], h, backend="jax")
-            
-        # 2-body energy
+
+        # 2-body energy (with correct counting factors)
         for (s1, s2), g in element_g.items():
-            # Same factor logic as get_sigma
             if s1 == s2:
                 factor = 0.5  # Intra-species: avoid double counting
             else:
-                # Check if both orderings are present
-                if (s2, s1) in element_g:
-                    factor = 0.5  # Both orderings present
-                else:
-                    factor = 1.0  # Only one ordering
+                factor = 0.5 if (s2, s1) in element_g else 1.0
             d = ds[(s1, s2)]
-            # Contract g * d
-            # Both are (p,q,r,s) tensors, d has batch
             E += factor * contract("pqrs, ...pqrs -> ...", g, d, backend="jax")
-            
+
         return E
