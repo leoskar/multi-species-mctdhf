@@ -4,6 +4,7 @@ from jax import jit, grad, vmap
 from opt_einsum import contract
 from functools import partial
 import numpy as np
+import itertools
 
 from .SemiDirectCI_n_species import SemiDirectCI_n_species
 from .integrators import get_crank_nicolson_fixed_iter
@@ -27,6 +28,13 @@ class MCTDHF_n_species:
         num_states=1,
         imag_time=False,
     ):
+        """Initialize the MCTDHF solver."""
+
+        err_msg = "Input lists must have the same length (number of species)."
+        np.testing.assert_equal(len(num_particles), len(num_mctdhf_orbitals), err_msg)
+        np.testing.assert_equal(len(num_particles), len(num_spatial_orbitals), err_msg)
+        np.testing.assert_equal(len(num_particles), len(h_list), err_msg)
+
         self.num_species = len(num_particles)
         self.num_particles = num_particles
         self.num_mctdhf_orbitals = num_mctdhf_orbitals
@@ -34,7 +42,7 @@ class MCTDHF_n_species:
         
         # Handle h inputs (callable or array)
         self.h_is_callable = [callable(h) for h in h_list]
-        self.h_list_init = h_list
+        self.h_list = h_list
         
         # Handle g inputs
         self.g_dict = g_dict
@@ -131,9 +139,9 @@ class MCTDHF_n_species:
         h_current = []
         for s in range(self.num_species):
             if self.h_is_callable[s]:
-                h_current.append(self.h_list_init[s](t))
+                h_current.append(self.h_list[s](t))
             else:
-                h_current.append(self.h_list_init[s])
+                h_current.append(self.h_list[s])
                 
         # 2. Transform integrals
         h_MO_list = []
@@ -288,9 +296,9 @@ class MCTDHF_n_species:
         h_current = []
         for s in range(self.num_species):
             if self.h_is_callable[s]:
-                h_current.append(self.h_list_init[s](t))
+                h_current.append(self.h_list[s](t))
             else:
-                h_current.append(self.h_list_init[s])
+                h_current.append(self.h_list[s])
                 
         # 2. Transform integrals and Accumulate Mean Fields
         h_MO_list = []      # List of (n_mo, n_mo)
@@ -392,39 +400,25 @@ class MCTDHF_n_species:
 
     @partial(jit, static_argnums=0)
     def ortonorm_b(self, b):
-        """Gram-Schmidt orthonormalization of b."""
-        # Assuming S=I for now as typical in this code
-        for i in range(b.shape[1]):
-            orto_adjustment = 0
-            for j in range(0, i):
-                # <b_i|b_j> projection
-                overlap = contract("i,i", b[:, i].conj(), b[:, j], backend="jax")
-                orto_adjustment += b[:, j] * overlap
-
-            b = b.at[:, i].add(-orto_adjustment)
-            norm = jnp.sqrt(contract("i,i", b[:, i].conj(), b[:, i], backend="jax"))
-            b = b.at[:, i].divide(norm)
-        return b
+        """Orthonormalize columns of b via QR decomposition."""
+        Q, R = jnp.linalg.qr(b)
+        # Fix sign convention: ensure diagonal of R is positive
+        # so that the result is unique and continuous
+        signs = jnp.sign(jnp.diag(R))
+        signs = jnp.where(signs == 0, 1.0, signs)
+        Q = Q * signs[None, :]
+        return Q
 
     @partial(jit, static_argnums=0)
     def ortonorm_C(self, C):
-        """Gram-Schmidt orthonormalization of C."""
-        # Reshape to (states, dets) for GS across states
-        # C shape: (states, dets_alpha, dets_beta...)
+        """Orthonormalize states in C via QR decomposition."""
         original_shape = C.shape
-        states = C.shape[0]
-        C_flat = C.reshape(states, -1)
-        
-        for i in range(states):
-            orto_adjustment = 0
-            for j in range(0, i):
-                 overlap = contract("i,i", C_flat[i].conj(), C_flat[j], backend="jax")
-                 orto_adjustment += overlap * C_flat[j]
-
-            C_flat = C_flat.at[i].add(-orto_adjustment)
-            norm = jnp.sqrt(contract("i,i", C_flat[i].conj(), C_flat[i], backend="jax"))
-            C_flat = C_flat.at[i].divide(norm)
-            
+        C_flat = C.reshape(C.shape[0], -1)
+        # QR on the transpose: columns = state vectors
+        Q, R = jnp.linalg.qr(C_flat.T)
+        signs = jnp.sign(jnp.diag(R))
+        signs = jnp.where(signs == 0, 1.0, signs)
+        C_flat = (Q * signs[None, :]).T
         return C_flat.reshape(original_shape)
 
     def compute_subsystem_character(self, C):
@@ -486,13 +480,16 @@ class MCTDHF_n_species:
             Packed state vector with localized states, ordered by energy.
         character : array
             Subsystem character matrix (num_states, num_species).
+        groups : list of lists
+            Degenerate subspace groupings. Each element is a list of state
+            indices that were grouped together for localization.
         """
         C, bs = self._y_to_Cb(y)
         num_states = C.shape[0]
         
         if num_states <= 1:
             character = self.compute_subsystem_character(C)
-            return y, character
+            return y, character, [[0]]
         
         # --- Step 1: Compute per-state energies and sort ---
         energies = jnp.real(self.calculate_energy(0.0, y))
@@ -574,7 +571,7 @@ class MCTDHF_n_species:
         y_localized = self._Cb_to_y(C, bs)
         character = self.compute_subsystem_character(C)
         
-        return y_localized, character
+        return y_localized, character, groups
     
     def _compute_total_purity(self, C_sub):
         """Compute total subsystem purity: Σ_α Σ_s Tr(ρ_s[α]²).
@@ -687,21 +684,37 @@ class MCTDHF_n_species:
                     )
         
         # Initialization
+        evals_list = []
         if bs_init_list is None:
             bs_init_list = []
-            for s in range(self.num_species):
-                rng = np.random.default_rng(42) # Use same seed for all species to ensure symmetry if dimensions match
-                r = rng.random((self.num_spatial_orbitals[s], self.num_mctdhf_orbitals[s]))
-                u, _, vh = np.linalg.svd(r, full_matrices=False)
-                bs_init_list.append(jnp.array((u @ vh), jnp.complex64))
+            for s, h in enumerate(self.h_list):
+                eigvals, eigvecs = np.linalg.eigh(np.array(h))
+                evals_list.append(eigvals)
+                # Take lowest num_mctdhf_orbitals eigenstates
+                b_init = eigvecs[:, :self.num_mctdhf_orbitals[s]]
+                bs_init_list.append(jnp.array(b_init, dtype=jnp.complex64))
+                print(f"Species {s}: lowest eigenvalues = {eigvals[:self.num_mctdhf_orbitals[s]]}")
         
         if C_init is None:
-             rng = np.random.default_rng(42)
-             dummy_dims = (self.num_states,) + tuple(self.num_dets)
-             r = rng.random(dummy_dims)
-             C_init = jnp.array(r, jnp.complex64)
-             C_init = C_init / jnp.linalg.norm(C_init)
+            # Enumerate all product states and sort by non-interacting energy
+            ranges = [range(n) for n in self.num_mctdhf_orbitals]
+            product_states = []
+            for indices in itertools.product(*ranges):
+                E_nonint = sum(evals_list[s][n] for s, n in enumerate(indices))
+                product_states.append((E_nonint, indices))
+            product_states.sort(key=lambda x: x[0])
 
+            C_init = np.zeros((self.num_states,) + tuple(self.num_mctdhf_orbitals))
+            rng = np.random.default_rng(42)
+            for state_idx in range(min(self.num_states, len(product_states))):
+                _, indices = product_states[state_idx]
+                C_init[(state_idx,) + indices] = 1.0
+            # Add small perturbation to break exact product-state symmetry
+            C_init += 1e-2 * rng.standard_normal(C_init.shape)
+            C_init = jnp.array(C_init, dtype=jnp.complex64)
+            # Re-orthonormalize (C_init must be orthonormal across states)
+            C_init = self.ortonorm_C(C_init)
+             
         y_init = self._Cb_to_y(C_init, bs_init_list)
         
         t = t_init
