@@ -692,12 +692,6 @@ class MCTDHF_n_species:
             if do_normalize:
                 C, bs = self._y_to_Cb(y)
                 C = self.ortonorm_C(C)
-                # Stack bs and vmap orthonormalization (assumes same shape)
-                # bs_stacked = jnp.stack(bs, axis=0)
-                # bs_stacked = jax.vmap(self.ortonorm_b)(bs_stacked)
-                # bs_new = [bs_stacked[s] for s in range(self.num_species)]
-
-                # In case the shapes are not the same, use a loop
                 bs_new = [self.ortonorm_b(b) for b in bs]
                 y = self._Cb_to_y(C, bs_new)
             return (t, y), (t, y)
