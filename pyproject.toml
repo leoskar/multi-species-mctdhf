@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mctdhf-n-species"
+version = "0.0.1"
+description = "N-species MCTDHF calculations using JAX with semi-direct CI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Oskar Leinonen"},
+]
+
+dependencies = [
+    "jax>=0.4",
+    "jaxlib>=0.4",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opt-einsum>=3.3",
+    "matplotlib>=3.5",
+]
+
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]"]
+cpu = ["jax[cpu]"]
+
+[project.urls]
+Repository = "https://github.com/leoskar/n-species-mctdh"
+
+[tool.setuptools.packages.find]
+include = ["mctdhf*"]
