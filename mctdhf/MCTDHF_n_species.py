@@ -654,7 +654,7 @@ class MCTDHF_n_species:
         evals_list = []
         if bs_init_list is None:
             bs_init_list = []
-            for s, h in enumerate(self.h_list):
+            for s, h in enumerate(self._get_h_current(t_init)):
                 eigvals, eigvecs = np.linalg.eigh(np.array(h))
                 evals_list.append(eigvals)
                 b_init = eigvecs[:, :self.num_mctdhf_orbitals[s]]
