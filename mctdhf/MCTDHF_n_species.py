@@ -214,7 +214,9 @@ class MCTDHF_n_species:
         C, bs = self._y_to_Cb(y)
 
         h_current = self._get_h_current(t)
-        h_MO_list = [self.transform_h(h_current[s], bs[s])[1] for s in range(self.num_species)]
+        h_MO_list = [
+            self.transform_h(h_current[s], bs[s])[1] for s in range(self.num_species)
+        ]
         g_MO_dict, _ = self._transform_all_g(bs, full=False)
 
         return self.dCI.calculate_energy(C, h_MO_list, g_MO_dict)
@@ -245,16 +247,20 @@ class MCTDHF_n_species:
         densities = []
 
         for s in range(self.num_species):
-            D_s = Ds[s]   # (batch, mo, mo)
+            D_s = Ds[s]  # (batch, mo, mo)
             b_s = bs_list[s]
 
             if spf_list is not None and len(spf_list) > s:
                 # Density on grid: ρ(x) = Σ_{nm} D_{nm} φ*_n(x) φ_m(x)
                 spf = spf_list[s]
-                rho = contract("ix,in,snm,jm,jx->sx", spf, b_s.conj(), D_s, b_s, spf, backend="jax")
+                rho = contract(
+                    "ix,in,snm,jm,jx->sx", spf, b_s.conj(), D_s, b_s, spf, backend="jax"
+                )
             else:
                 # Density matrix in spatial basis: ρ_{ij} = Σ_{nm} D_{nm} b*_{in} b_{jm}
-                rho = contract("in, snm, jm -> sij", b_s.conj(), D_s, b_s, backend="jax")
+                rho = contract(
+                    "in, snm, jm -> sij", b_s.conj(), D_s, b_s, backend="jax"
+                )
             densities.append(rho)
         return densities
 
@@ -304,8 +310,8 @@ class MCTDHF_n_species:
 
         # Contract: ⟨Ψ₁|Ψ₂⟩ = C₁*_{s,a,b,...} · C₂_{s,d,e,...} · S⁰_{ad} · S¹_{be} · ...
         K = self.num_species
-        c1 = [chr(97 + i) for i in range(K)]          # a, b, c, ...
-        c2 = [chr(97 + K + i) for i in range(K)]      # d, e, f, ...
+        c1 = [chr(97 + i) for i in range(K)]  # a, b, c, ...
+        c2 = [chr(97 + K + i) for i in range(K)]  # d, e, f, ...
         s_pairs = ",".join(f"{c1[i]}{c2[i]}" for i in range(K))
         einsum_str = f"s{''.join(c1)},s{''.join(c2)},{s_pairs}->s"
 
@@ -331,7 +337,7 @@ class MCTDHF_n_species:
         g_MO_dict, g_mix_tensors = self._transform_all_g(bs, full=True)
 
         # 2. CI coefficients: dC/dt = ∓ H|Ψ⟩
-        sigma = self.dCI.get_sigma(C, h_MO_list, g_MO_dict)
+        C_dot = self._rhs_C_linear(C, h_MO_list, g_MO_dict)
 
         # 3. Orbital coefficients: db_s/dt = ∓ D⁻¹ [(1-P)h + Σ_k D⁻¹ d_{sk} (1-P)W_k]
         Ds = self.dCI.get_1p_RDMs(C)
@@ -366,8 +372,84 @@ class MCTDHF_n_species:
             else:
                 b_dots.append(-1j * b_dot_s)
 
-        C_dot = -sigma if self.imag_time else -1j * sigma
         return self._Cb_to_y(C_dot, b_dots)
+
+    def _rhs_C_linear(self, C, h_MO_list, g_MO_dict):
+        """CI RHS with pre-computed MO integrals (linear in C).
+
+        Used both in __call__ (coupled propagation) and by the CMF integrator
+        (decoupled propagation with frozen orbitals).
+
+        Parameters
+        ----------
+        C : jnp.ndarray
+            CI coefficients, shape (num_states, n_dets_0, ...).
+        h_MO_list : list of jnp.ndarray
+            Fully transformed 1-body integrals per species.
+        g_MO_dict : dict
+            Fully transformed 2-body integrals {(s1, s2): g_4}.
+
+        Returns
+        -------
+        C_dot : jnp.ndarray
+            Time derivative of C, same shape as C.
+        """
+        sigma = self.dCI.get_sigma(C, h_MO_list, g_MO_dict)
+        return -sigma if self.imag_time else -1j * sigma
+
+    def _rhs_b_linear(self, b_s, s, h_current_s, D_inv, ds, bs_frozen, P_frozen):
+        """Orbital RHS with frozen projector and density matrices (linear in b_s).
+
+        Used by the CMF integrator for the decoupled orbital propagation.
+        The projector P and density matrices are frozen at their values from
+        the beginning of the time step, making this linear in b_s.
+
+        Parameters
+        ----------
+        b_s : jnp.ndarray
+            Orbital matrix for species s, shape (n_spatial, n_mo).
+        s : int
+            Species index.
+        h_current_s : jnp.ndarray
+            1-body Hamiltonian for species s in spatial basis.
+        D_inv : jnp.ndarray
+            Regularized inverse 1-RDM for species s.
+        ds : dict
+            State-averaged 2-RDMs {(s1, s2): d_pqrs}.
+        bs_frozen : list of jnp.ndarray
+            Orbital matrices for all species (frozen at step start).
+        P_frozen : jnp.ndarray
+            Frozen projector P = b·b† for species s.
+
+        Returns
+        -------
+        b_dot : jnp.ndarray
+            Time derivative of b_s, same shape as b_s.
+        """
+        # 1-body: (1-P)h contribution
+        h_1 = contract("ij, jm -> im", h_current_s, b_s, backend="jax")
+        h_3 = P_frozen @ h_1
+        b_dot = h_1 - h_3
+
+        # 2-body: mean-field contribution with frozen tau orbitals and P
+        for k in range(self.num_species):
+            if (s, k) in self.g_dict:
+                g_spatial = self.g_dict[(s, k)]
+            elif (k, s) in self.g_dict:
+                g_spatial = self._transpose_g(self.g_dict[(k, s)])
+            else:
+                continue
+
+            # Transform g with b_s (varies) and bs_frozen[k] (fixed)
+            g_3, g_4, _ = self.transform_g(g_spatial, b_s, bs_frozen[k])
+            g_5 = contract("ij, jqrs -> iqrs", P_frozen, g_3, backend="jax")
+
+            d_sk = ds[(s, k)]
+            b_dot = b_dot + contract(
+                "np, pqrs, iqrs -> in", D_inv, d_sk, g_3 - g_5, backend="jax"
+            )
+
+        return -b_dot if self.imag_time else -1j * b_dot
 
     # ── Orthonormalization ────────────────────────────────────────────────
 
@@ -413,14 +495,18 @@ class MCTDHF_n_species:
             # Vectorized over states
             diags = jnp.diagonal(D_s, axis1=-2, axis2=-1)  # (num_states, n_orb)
             weights = jnp.abs(diags)
-            avg_orbital = jnp.sum(orbital_weights * weights, axis=-1) / jnp.sum(weights, axis=-1)
+            avg_orbital = jnp.sum(orbital_weights * weights, axis=-1) / jnp.sum(
+                weights, axis=-1
+            )
             character = character.at[:, s].set(avg_orbital)
 
         return character
 
     # ── State localization ────────────────────────────────────────────────
 
-    def localize_states(self, y, energy_tol=1e-6, max_sweeps=20, tol=1e-8, verbose=False):
+    def localize_states(
+        self, y, energy_tol=1e-6, max_sweeps=20, tol=1e-8, verbose=False
+    ):
         """Localize degenerate states to Hartree products (post-processing).
 
         Within degenerate subspaces (energies within energy_tol), states are
@@ -480,7 +566,9 @@ class MCTDHF_n_species:
         if verbose:
             for g_idx, group in enumerate(groups):
                 E_avg = float(jnp.mean(energies[jnp.array(group)]))
-                print(f"  Group {g_idx}: states {group}, E ≈ {E_avg:.6f}, size={len(group)}")
+                print(
+                    f"  Group {g_idx}: states {group}, E ≈ {E_avg:.6f}, size={len(group)}"
+                )
 
         # Step 3: Jacobi localization within each degenerate subspace
         for group in groups:
@@ -517,7 +605,9 @@ class MCTDHF_n_species:
 
                 if verbose:
                     purity = self._compute_total_purity(C_sub)
-                    print(f"    Sweep {sweep+1}: max_rotation={max_rotation:.6f}, purity={purity:.6f}")
+                    print(
+                        f"    Sweep {sweep+1}: max_rotation={max_rotation:.6f}, purity={purity:.6f}"
+                    )
 
                 if max_rotation < tol:
                     if verbose:
@@ -659,7 +749,10 @@ class MCTDHF_n_species:
                     f"bs_init_list must have {self.num_species} elements, got {len(bs_init_list)}"
                 )
             for s, b in enumerate(bs_init_list):
-                expected_shape = (self.num_spatial_orbitals[s], self.num_mctdhf_orbitals[s])
+                expected_shape = (
+                    self.num_spatial_orbitals[s],
+                    self.num_mctdhf_orbitals[s],
+                )
                 if b.shape != expected_shape:
                     raise ValueError(
                         f"bs_init_list[{s}] has shape {b.shape}, expected {expected_shape}"
@@ -672,9 +765,11 @@ class MCTDHF_n_species:
             for s, h in enumerate(self._get_h_current(t_init)):
                 eigvals, eigvecs = np.linalg.eigh(np.array(h))
                 evals_list.append(eigvals)
-                b_init = eigvecs[:, :self.num_mctdhf_orbitals[s]]
+                b_init = eigvecs[:, : self.num_mctdhf_orbitals[s]]
                 bs_init_list.append(jnp.array(b_init, dtype=jnp.complex64))
-                print(f"Species {s}: lowest eigenvalues = {eigvals[:self.num_mctdhf_orbitals[s]]}")
+                print(
+                    f"Species {s}: lowest eigenvalues = {eigvals[:self.num_mctdhf_orbitals[s]]}"
+                )
 
         if C_init is None:
             # Product states ordered by non-interacting energy
@@ -694,11 +789,17 @@ class MCTDHF_n_species:
         # Add noise to initial guesses and re-orthonormalize
         rng = np.random.default_rng(42)
         if noise_C > 0:
-            C_init = C_init + noise_C * jnp.array(rng.standard_normal(C_init.shape), dtype=jnp.complex64)
+            C_init = C_init + noise_C * jnp.array(
+                rng.standard_normal(C_init.shape), dtype=jnp.complex64
+            )
             C_init = self.ortonorm_C(C_init)
         if noise_bs > 0:
             bs_init_list = [
-                self.ortonorm_b(b + noise_bs * jnp.array(rng.standard_normal(b.shape), dtype=jnp.complex64))
+                self.ortonorm_b(
+                    b
+                    + noise_bs
+                    * jnp.array(rng.standard_normal(b.shape), dtype=jnp.complex64)
+                )
                 for b in bs_init_list
             ]
 
@@ -726,6 +827,7 @@ class MCTDHF_n_species:
 
 
 # ── DVR specialization ────────────────────────────────────────────────────
+
 
 class MCTDHF_n_species_DVR(MCTDHF_n_species):
     """MCTDHF variant for DVR (Discrete Variable Representation) basis.
