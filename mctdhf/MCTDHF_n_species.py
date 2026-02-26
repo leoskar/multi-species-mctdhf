@@ -340,7 +340,7 @@ class MCTDHF_n_species:
         b_dots = []
         for s in range(self.num_species):
             # Use pinv for stability with potentially singular density matrices
-            D_inv = jnp.linalg.pinv(Ds[s], rcond=1e-6)
+            D_inv = jnp.linalg.pinv(Ds[s], rcond=1e-4, hermitian=True)
             h_1, _, h_3 = h_transformed[s]
 
             # (1-P)h contribution
