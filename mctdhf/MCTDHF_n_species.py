@@ -612,6 +612,8 @@ class MCTDHF_n_species:
         bs_init_list=None,
         C_init=None,
         normalize=None,
+        noise_C=1e-2,
+        noise_bs=0.0,
     ):
         """Run the MCTDHF time propagation.
 
@@ -629,6 +631,13 @@ class MCTDHF_n_species:
             Initial CI coefficients. If None, uses energy-ordered product states.
         normalize : bool, optional
             Force normalization each step. Defaults to True for imaginary time.
+        noise_C : float
+            Magnitude of random perturbation added to C_init. Set to 0 for
+            no perturbation. Applied to both default and user-provided C_init.
+        noise_bs : float
+            Magnitude of random perturbation added to each b in bs_init_list.
+            Set to 0 for no perturbation. Applied to both default and
+            user-provided bs_init_list.
 
         Returns
         -------
@@ -671,15 +680,21 @@ class MCTDHF_n_species:
             product_states.sort(key=lambda x: x[0])
 
             C_init = np.zeros((self.num_states,) + tuple(self.num_mctdhf_orbitals))
-            rng = np.random.default_rng(42)
             for state_idx in range(min(self.num_states, len(product_states))):
                 _, indices = product_states[state_idx]
                 C_init[(state_idx,) + indices] = 1.0
-            # Small perturbation to break exact product-state symmetry
-            C_init += 1e-2 * rng.standard_normal(C_init.shape)
             C_init = jnp.array(C_init, dtype=jnp.complex64)
-            # Re-orthonormalize (C_init must be orthonormal across states)
+
+        # Add noise to initial guesses and re-orthonormalize
+        rng = np.random.default_rng(42)
+        if noise_C > 0:
+            C_init = C_init + noise_C * jnp.array(rng.standard_normal(C_init.shape), dtype=jnp.complex64)
             C_init = self.ortonorm_C(C_init)
+        if noise_bs > 0:
+            bs_init_list = [
+                self.ortonorm_b(b + noise_bs * jnp.array(rng.standard_normal(b.shape), dtype=jnp.complex64))
+                for b in bs_init_list
+            ]
 
         y_init = self._Cb_to_y(C_init, bs_init_list)
         t = t_init
