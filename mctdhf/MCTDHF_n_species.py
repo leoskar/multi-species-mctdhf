@@ -339,8 +339,11 @@ class MCTDHF_n_species:
 
         b_dots = []
         for s in range(self.num_species):
-            # Use pinv for stability with potentially singular density matrices
-            D_inv = jnp.linalg.pinv(Ds[s], rcond=1e-4, hermitian=True)
+            # Tikhonov regularization: (D + εI)⁻¹ for smooth handling of singular density matrices
+            eps = 1e-6
+            eigvals, eigvecs = jnp.linalg.eigh(Ds[s])
+            D_inv = (eigvecs / (eigvals + eps)) @ eigvecs.conj().T
+
             h_1, _, h_3 = h_transformed[s]
 
             # (1-P)h contribution
