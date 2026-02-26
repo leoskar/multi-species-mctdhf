@@ -15,7 +15,7 @@ pip install git+https://github.com/leoskar/n-species-mctdh.git
 With CUDA support:
 
 ```bash
-pip install "mctdhf-n-species[cuda12] @ git+https://github.com/leoskar/n-species-mctdh.git"
+pip install "mctdhf-n-species[cuda12] @ git+ssh://git@github.com/leoskar/n-species-mctdh.git"
 ```
 
 ## Dependencies
