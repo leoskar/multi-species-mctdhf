@@ -42,6 +42,8 @@ class MCTDHF_n_species:
         Number of electronic states to propagate simultaneously.
     imag_time : bool
         If True, propagate in imaginary time (for ground-state search).
+    eps : float
+        Tikhonov regularization parameter for the density matrix inversion.
     """
 
     def __init__(
@@ -53,6 +55,7 @@ class MCTDHF_n_species:
         num_spatial_orbitals,
         num_states=1,
         imag_time=False,
+        eps=1e-6,
     ):
         err_msg = "Input lists must have the same length (number of species)."
         np.testing.assert_equal(len(num_particles), len(num_mctdhf_orbitals), err_msg)
@@ -72,6 +75,7 @@ class MCTDHF_n_species:
         self.num_dets = self.dCI.num_dets
         self.num_states = num_states
         self.imag_time = imag_time
+        self.eps = eps
 
     # ── State vector packing / unpacking ──────────────────────────────────
 
@@ -340,9 +344,8 @@ class MCTDHF_n_species:
         b_dots = []
         for s in range(self.num_species):
             # Tikhonov regularization: (D + εI)⁻¹ for smooth handling of singular density matrices
-            eps = 1e-6
             eigvals, eigvecs = jnp.linalg.eigh(Ds[s])
-            D_inv = (eigvecs / (eigvals + eps)) @ eigvecs.conj().T
+            D_inv = (eigvecs / (eigvals + self.eps)) @ eigvecs.conj().T
 
             h_1, _, h_3 = h_transformed[s]
 
