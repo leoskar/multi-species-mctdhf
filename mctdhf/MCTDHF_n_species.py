@@ -708,7 +708,7 @@ class MCTDHF_n_species:
         bs_init_list=None,
         C_init=None,
         normalize=None,
-        noise_C=1e-2,
+        noise_C=0.0,
         noise_bs=0.0,
     ):
         """Run the MCTDHF time propagation.
