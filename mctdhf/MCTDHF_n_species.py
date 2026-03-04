@@ -56,6 +56,7 @@ class MCTDHF_n_species:
         num_states=1,
         imag_time=False,
         eps=1e-6,
+        state_weights=None,
     ):
         err_msg = "Input lists must have the same length (number of species)."
         np.testing.assert_equal(len(num_particles), len(num_mctdhf_orbitals), err_msg)
@@ -76,6 +77,19 @@ class MCTDHF_n_species:
         self.num_states = num_states
         self.imag_time = imag_time
         self.eps = eps
+
+        # State-averaging weights for orbital optimization.
+        # None → uniform sum (backward-compatible default).
+        # When provided, weights are normalized to sum to 1.
+        if state_weights is not None:
+            w = jnp.array(state_weights, dtype=jnp.float32)
+            if w.shape != (num_states,):
+                raise ValueError(
+                    f"state_weights must have shape ({num_states},), got {w.shape}"
+                )
+            self.state_weights = w / jnp.sum(w)
+        else:
+            self.state_weights = None
 
     # ── State vector packing / unpacking ──────────────────────────────────
 
@@ -99,6 +113,26 @@ class MCTDHF_n_species:
             start += b_size
 
         return C, bs_list
+
+    def _state_average(self, tensor):
+        """Average a tensor over the leading state axis.
+
+        If state_weights is None, uses uniform sum (backward-compatible).
+        Otherwise, contracts with normalized weights.
+
+        Parameters
+        ----------
+        tensor : jnp.ndarray
+            Tensor with leading state dimension, shape (num_states, ...).
+
+        Returns
+        -------
+        jnp.ndarray
+            State-averaged tensor, shape (...).
+        """
+        if self.state_weights is None:
+            return jnp.sum(tensor, axis=0)
+        return contract("s,s...->...", self.state_weights, tensor, backend="jax")
 
     # ── Integral helpers ──────────────────────────────────────────────────
 
@@ -343,9 +377,9 @@ class MCTDHF_n_species:
         Ds = self.dCI.get_1p_RDMs(C)
         ds = self.dCI.get_2p_RDMs(C)
 
-        # State-average RDMs (sum over batch dimension)
-        Ds = [jnp.sum(D, axis=0) for D in Ds]
-        ds = {k: jnp.sum(v, axis=0) for k, v in ds.items()}
+        # State-average RDMs (weighted or uniform sum over batch dimension)
+        Ds = [self._state_average(D) for D in Ds]
+        ds = {k: self._state_average(v) for k, v in ds.items()}
 
         b_dots = []
         for s in range(self.num_species):
