@@ -227,8 +227,7 @@ def _compute_density_quantities(mctdh, C):
 
     D_invs = []
     for s in range(mctdh.num_species):
-        eigvals, eigvecs = jnp.linalg.eigh(Ds[s])
-        D_inv = (eigvecs / (eigvals + mctdh.eps)) @ eigvecs.conj().T
+        D_inv = mctdh._invert_density_matrix(Ds[s])
         D_invs.append(D_inv)
 
     return D_invs, ds

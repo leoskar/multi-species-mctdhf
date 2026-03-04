@@ -255,102 +255,6 @@ class MCTDHF_n_species:
 
         return self.dCI.calculate_energy(C, h_MO_list, g_MO_dict)
 
-    # ── Observables ───────────────────────────────────────────────────────
-
-    @partial(jit, static_argnums=0)
-    def calculate_particle_densities(self, C, bs_list, spf_list=None):
-        """Calculate particle densities for all species.
-
-        Parameters
-        ----------
-        C : jnp.ndarray
-            CI coefficients.
-        bs_list : list of jnp.ndarray
-            Orbital coefficient matrices.
-        spf_list : list of jnp.ndarray, optional
-            Single-particle functions on the grid. If provided, returns
-            density on the grid; otherwise returns the density matrix in
-            the spatial orbital basis.
-
-        Returns
-        -------
-        list of jnp.ndarray
-            Density for each species.
-        """
-        Ds = self.dCI.get_1p_RDMs(C)
-        densities = []
-
-        for s in range(self.num_species):
-            D_s = Ds[s]  # (batch, mo, mo)
-            b_s = bs_list[s]
-
-            if spf_list is not None and len(spf_list) > s:
-                # Density on grid: ρ(x) = Σ_{nm} D_{nm} φ*_n(x) φ_m(x)
-                spf = spf_list[s]
-                rho = contract(
-                    "ix,in,snm,jm,jx->sx", spf, b_s.conj(), D_s, b_s, spf, backend="jax"
-                )
-            else:
-                # Density matrix in spatial basis: ρ_{ij} = Σ_{nm} D_{nm} b*_{in} b_{jm}
-                rho = contract(
-                    "in, snm, jm -> sij", b_s.conj(), D_s, b_s, backend="jax"
-                )
-            densities.append(rho)
-        return densities
-
-    @partial(jit, static_argnums=0)
-    def calculate_overlap(self, y1, y2):
-        """Calculate overlap ⟨Ψ₁|Ψ₂⟩ between two multi-species states.
-
-        The overlap factorizes over species: for each species s, we compute the
-        determinant overlap matrix S^s_{IJ} = det(O^s_{occ_I, occ_J}) where
-        O^s_{ij} = ⟨φ^1_i|φ^2_j⟩ is the MO overlap. The full overlap is then
-        ⟨Ψ₁|Ψ₂⟩ = Σ_{I,J,...} C₁*_{I,J,...} · C₂_{I',J',...} · S⁰_{II'} · S¹_{JJ'} · ...
-
-        Parameters
-        ----------
-        y1, y2 : jnp.ndarray
-            Packed state vectors.
-
-        Returns
-        -------
-        jnp.ndarray
-            Overlap per state, shape (num_states,).
-        """
-        C1, bs1 = self._y_to_Cb(y1)
-        C2, bs2 = self._y_to_Cb(y2)
-
-        # Build determinant overlap matrices S_{IJ} = det(⟨φ^1_i|φ^2_j⟩) for each species
-        S_matrices = []
-        for s in range(self.num_species):
-            b1, b2 = bs1[s], bs2[s]
-            I = jnp.array(self.dCI.I[s])
-            n_dets = self.num_dets[s]
-            n_elec = self.num_particles[s]
-
-            # MO overlap O_{ij} = ⟨φ^1_i|φ^2_j⟩
-            O = contract("ki, kj -> ij", b1.conj(), b2, backend="jax")
-
-            # Extract occupied submatrices O[occ_I, occ_J] for each det pair (I, J)
-            Mask = contract("ai, bj -> abij", I, I, backend="jax")
-            Val = contract("ai, bj, ij -> abij", I, I, O, backend="jax")
-
-            expected_size = n_dets * n_dets * n_elec * n_elec
-            indices = jnp.nonzero(Mask.reshape(-1), size=expected_size)
-            elems = Val.reshape(-1)[indices]
-
-            mat = elems.reshape(n_dets, n_dets, n_elec, n_elec)
-            S_matrices.append(jnp.linalg.det(mat))
-
-        # Contract: ⟨Ψ₁|Ψ₂⟩ = C₁*_{s,a,b,...} · C₂_{s,d,e,...} · S⁰_{ad} · S¹_{be} · ...
-        K = self.num_species
-        c1 = [chr(97 + i) for i in range(K)]  # a, b, c, ...
-        c2 = [chr(97 + K + i) for i in range(K)]  # d, e, f, ...
-        s_pairs = ",".join(f"{c1[i]}{c2[i]}" for i in range(K))
-        einsum_str = f"s{''.join(c1)},s{''.join(c2)},{s_pairs}->s"
-
-        return contract(einsum_str, C1.conj(), C2, *S_matrices, backend="jax")
-
     # ── Equations of motion ───────────────────────────────────────────────
 
     @partial(jit, static_argnums=0)
@@ -383,9 +287,7 @@ class MCTDHF_n_species:
 
         b_dots = []
         for s in range(self.num_species):
-            # Tikhonov regularization: (D + εI)⁻¹ for smooth handling of singular density matrices
-            eigvals, eigvecs = jnp.linalg.eigh(Ds[s])
-            D_inv = (eigvecs / (eigvals + self.eps)) @ eigvecs.conj().T
+            D_inv = self._invert_density_matrix(Ds[s])
 
             h_1, _, h_3 = h_transformed[s]
 
@@ -485,6 +387,16 @@ class MCTDHF_n_species:
 
         return -b_dot if self.imag_time else -1j * b_dot
 
+    @partial(jit, static_argnums=0)
+    def _invert_density_matrix(self, D):
+        """Regularized inverse of density matrix."""
+        # Increased precision for the inversion
+        D_64 = D.astype(jnp.complex128)
+        eigvals_64, eigvecs_64 = jnp.linalg.eigh(D_64)
+        # Tikhonov regularization: (D + εI)⁻¹ for smooth handling of singular density matrices
+        D_inv_64 = (eigvecs_64 / (eigvals_64 + self.eps)) @ eigvecs_64.conj().T
+        return D_inv_64.astype(jnp.complex64)
+
     # ── Orthonormalization ────────────────────────────────────────────────
 
     @partial(jit, static_argnums=0)
@@ -505,6 +417,229 @@ class MCTDHF_n_species:
         signs = jnp.sign(jnp.diag(R))
         signs = jnp.where(signs == 0, 1.0, signs)
         return ((Q * signs[None, :]).T).reshape(original_shape)
+
+    # ── Integration ───────────────────────────────────────────────────────
+
+    def integrate(
+        self,
+        integrator,
+        num_steps,
+        t_init=0,
+        bs_init_list=None,
+        C_init=None,
+        normalize=None,
+        noise_C=0.0,
+        noise_bs=0.0,
+    ):
+        """Run the MCTDHF time propagation.
+
+        Parameters
+        ----------
+        integrator : callable
+            Integration step function (t, y) → (t_new, y_new).
+        num_steps : int
+            Number of time steps.
+        t_init : float
+            Initial time.
+        bs_init_list : list of jnp.ndarray, optional
+            Initial orbitals. If None, uses lowest eigenstates of h.
+        C_init : jnp.ndarray, optional
+            Initial CI coefficients. If None, uses energy-ordered product states.
+        normalize : bool, optional
+            Force normalization each step. Defaults to True for imaginary time.
+        noise_C : float
+            Magnitude of random perturbation added to C_init. Set to 0 for
+            no perturbation. Applied to both default and user-provided C_init.
+        noise_bs : float
+            Magnitude of random perturbation added to each b in bs_init_list.
+            Set to 0 for no perturbation. Applied to both default and
+            user-provided bs_init_list.
+
+        Returns
+        -------
+        ts : jnp.ndarray
+            Time points (num_steps + 1,).
+        ys : jnp.ndarray
+            State vectors (num_steps + 1, dim_y).
+        """
+        # Validate shapes
+        if bs_init_list is not None:
+            if len(bs_init_list) != self.num_species:
+                raise ValueError(
+                    f"bs_init_list must have {self.num_species} elements, got {len(bs_init_list)}"
+                )
+            for s, b in enumerate(bs_init_list):
+                expected_shape = (
+                    self.num_spatial_orbitals[s],
+                    self.num_mctdhf_orbitals[s],
+                )
+                if b.shape != expected_shape:
+                    raise ValueError(
+                        f"bs_init_list[{s}] has shape {b.shape}, expected {expected_shape}"
+                    )
+
+        # Default initialization: lowest eigenstates of single-particle Hamiltonians
+        evals_list = []
+        if bs_init_list is None:
+            bs_init_list = []
+            for s, h in enumerate(self._get_h_current(t_init)):
+                eigvals, eigvecs = np.linalg.eigh(np.array(h))
+                evals_list.append(eigvals)
+                b_init = eigvecs[:, : self.num_mctdhf_orbitals[s]]
+                bs_init_list.append(jnp.array(b_init, dtype=jnp.complex64))
+                print(
+                    f"Species {s}: lowest eigenvalues = {eigvals[:self.num_mctdhf_orbitals[s]]}"
+                )
+
+        if C_init is None:
+            # Product states ordered by non-interacting energy
+            ranges = [range(n) for n in self.num_mctdhf_orbitals]
+            product_states = []
+            for indices in itertools.product(*ranges):
+                E_nonint = sum(evals_list[s][n] for s, n in enumerate(indices))
+                product_states.append((E_nonint, indices))
+            product_states.sort(key=lambda x: x[0])
+
+            C_init = np.zeros((self.num_states,) + tuple(self.num_mctdhf_orbitals))
+            for state_idx in range(min(self.num_states, len(product_states))):
+                _, indices = product_states[state_idx]
+                C_init[(state_idx,) + indices] = 1.0
+            C_init = jnp.array(C_init, dtype=jnp.complex64)
+
+        # Add noise to initial guesses and re-orthonormalize
+        rng = np.random.default_rng(42)
+        if noise_C > 0:
+            C_init = C_init + noise_C * jnp.array(
+                rng.standard_normal(C_init.shape), dtype=jnp.complex64
+            )
+            C_init = self.ortonorm_C(C_init)
+        if noise_bs > 0:
+            bs_init_list = [
+                self.ortonorm_b(
+                    b
+                    + noise_bs
+                    * jnp.array(rng.standard_normal(b.shape), dtype=jnp.complex64)
+                )
+                for b in bs_init_list
+            ]
+
+        y_init = self._Cb_to_y(C_init, bs_init_list)
+        t = t_init
+        y = y_init
+        do_normalize = normalize or self.imag_time
+
+        def step_fn(carry, _):
+            t, y = carry
+            t, y = integrator(t, y)
+            if do_normalize:
+                C, bs = self._y_to_Cb(y)
+                C = self.ortonorm_C(C)
+                bs_new = [self.ortonorm_b(b) for b in bs]
+                y = self._Cb_to_y(C, bs_new)
+            return (t, y), (t, y)
+
+        _, (ts_arr, ys_arr) = jax.lax.scan(step_fn, (t, y), None, length=num_steps)
+
+        # Prepend initial values
+        ts = jnp.concatenate([jnp.array([t_init]), ts_arr])
+        ys = jnp.concatenate([y_init[None, :], ys_arr])
+        return ts, ys
+
+    # ── Observables ───────────────────────────────────────────────────────
+
+    @partial(jit, static_argnums=0)
+    def calculate_particle_densities(self, C, bs_list, spf_list=None):
+        """Calculate particle densities for all species.
+
+        Parameters
+        ----------
+        C : jnp.ndarray
+            CI coefficients.
+        bs_list : list of jnp.ndarray
+            Orbital coefficient matrices.
+        spf_list : list of jnp.ndarray, optional
+            Single-particle functions on the grid. If provided, returns
+            density on the grid; otherwise returns the density matrix in
+            the spatial orbital basis.
+
+        Returns
+        -------
+        list of jnp.ndarray
+            Density for each species.
+        """
+        Ds = self.dCI.get_1p_RDMs(C)
+        densities = []
+
+        for s in range(self.num_species):
+            D_s = Ds[s]  # (batch, mo, mo)
+            b_s = bs_list[s]
+
+            if spf_list is not None and len(spf_list) > s:
+                # Density on grid: ρ(x) = Σ_{nm} D_{nm} φ*_n(x) φ_m(x)
+                spf = spf_list[s]
+                rho = contract(
+                    "ix,in,snm,jm,jx->sx", spf, b_s.conj(), D_s, b_s, spf, backend="jax"
+                )
+            else:
+                # Density matrix in spatial basis: ρ_{ij} = Σ_{nm} D_{nm} b*_{in} b_{jm}
+                rho = contract(
+                    "in, snm, jm -> sij", b_s.conj(), D_s, b_s, backend="jax"
+                )
+            densities.append(rho)
+        return densities
+
+    @partial(jit, static_argnums=0)
+    def calculate_overlap(self, y1, y2):
+        """Calculate overlap ⟨Ψ₁|Ψ₂⟩ between two multi-species states.
+
+        The overlap factorizes over species: for each species s, we compute the
+        determinant overlap matrix S^s_{IJ} = det(O^s_{occ_I, occ_J}) where
+        O^s_{ij} = ⟨φ^1_i|φ^2_j⟩ is the MO overlap. The full overlap is then
+        ⟨Ψ₁|Ψ₂⟩ = Σ_{I,J,...} C₁*_{I,J,...} · C₂_{I',J',...} · S⁰_{II'} · S¹_{JJ'} · ...
+
+        Parameters
+        ----------
+        y1, y2 : jnp.ndarray
+            Packed state vectors.
+
+        Returns
+        -------
+        jnp.ndarray
+            Overlap per state, shape (num_states,).
+        """
+        C1, bs1 = self._y_to_Cb(y1)
+        C2, bs2 = self._y_to_Cb(y2)
+
+        # Build determinant overlap matrices S_{IJ} = det(⟨φ^1_i|φ^2_j⟩) for each species
+        S_matrices = []
+        for s in range(self.num_species):
+            b1, b2 = bs1[s], bs2[s]
+            I = jnp.array(self.dCI.I[s])
+            n_dets = self.num_dets[s]
+            n_elec = self.num_particles[s]
+
+            # MO overlap O_{ij} = ⟨φ^1_i|φ^2_j⟩
+            O = contract("ki, kj -> ij", b1.conj(), b2, backend="jax")
+
+            # Extract occupied submatrices O[occ_I, occ_J] for each det pair (I, J)
+            Mask = contract("ai, bj -> abij", I, I, backend="jax")
+            Val = contract("ai, bj, ij -> abij", I, I, O, backend="jax")
+
+            expected_size = n_dets * n_dets * n_elec * n_elec
+            indices = jnp.nonzero(Mask.reshape(-1), size=expected_size)
+            elems = Val.reshape(-1)[indices]
+
+            mat = elems.reshape(n_dets, n_dets, n_elec, n_elec)
+            S_matrices.append(jnp.linalg.det(mat))
+
+        # Contract: ⟨Ψ₁|Ψ₂⟩ = C₁*_{s,a,b,...} · C₂_{s,d,e,...} · S⁰_{ad} · S¹_{be} · ...
+        K = self.num_species
+        c1 = [chr(97 + i) for i in range(K)]  # a, b, c, ...
+        c2 = [chr(97 + K + i) for i in range(K)]  # d, e, f, ...
+        s_pairs = ",".join(f"{c1[i]}{c2[i]}" for i in range(K))
+        einsum_str = f"s{''.join(c1)},s{''.join(c2)},{s_pairs}->s"
+
+        return contract(einsum_str, C1.conj(), C2, *S_matrices, backend="jax")
 
     # ── State analysis (post-processing) ──────────────────────────────────
 
@@ -731,133 +866,6 @@ class MCTDHF_n_species:
             E_total = E_total + (t_AR - t_BR)
 
         return jnp.arctan2(2 * E_total, D_total) / 4
-
-    # ── Integration ───────────────────────────────────────────────────────
-
-    def integrate(
-        self,
-        integrator,
-        num_steps,
-        t_init=0,
-        bs_init_list=None,
-        C_init=None,
-        normalize=None,
-        noise_C=0.0,
-        noise_bs=0.0,
-    ):
-        """Run the MCTDHF time propagation.
-
-        Parameters
-        ----------
-        integrator : callable
-            Integration step function (t, y) → (t_new, y_new).
-        num_steps : int
-            Number of time steps.
-        t_init : float
-            Initial time.
-        bs_init_list : list of jnp.ndarray, optional
-            Initial orbitals. If None, uses lowest eigenstates of h.
-        C_init : jnp.ndarray, optional
-            Initial CI coefficients. If None, uses energy-ordered product states.
-        normalize : bool, optional
-            Force normalization each step. Defaults to True for imaginary time.
-        noise_C : float
-            Magnitude of random perturbation added to C_init. Set to 0 for
-            no perturbation. Applied to both default and user-provided C_init.
-        noise_bs : float
-            Magnitude of random perturbation added to each b in bs_init_list.
-            Set to 0 for no perturbation. Applied to both default and
-            user-provided bs_init_list.
-
-        Returns
-        -------
-        ts : jnp.ndarray
-            Time points (num_steps + 1,).
-        ys : jnp.ndarray
-            State vectors (num_steps + 1, dim_y).
-        """
-        # Validate shapes
-        if bs_init_list is not None:
-            if len(bs_init_list) != self.num_species:
-                raise ValueError(
-                    f"bs_init_list must have {self.num_species} elements, got {len(bs_init_list)}"
-                )
-            for s, b in enumerate(bs_init_list):
-                expected_shape = (
-                    self.num_spatial_orbitals[s],
-                    self.num_mctdhf_orbitals[s],
-                )
-                if b.shape != expected_shape:
-                    raise ValueError(
-                        f"bs_init_list[{s}] has shape {b.shape}, expected {expected_shape}"
-                    )
-
-        # Default initialization: lowest eigenstates of single-particle Hamiltonians
-        evals_list = []
-        if bs_init_list is None:
-            bs_init_list = []
-            for s, h in enumerate(self._get_h_current(t_init)):
-                eigvals, eigvecs = np.linalg.eigh(np.array(h))
-                evals_list.append(eigvals)
-                b_init = eigvecs[:, : self.num_mctdhf_orbitals[s]]
-                bs_init_list.append(jnp.array(b_init, dtype=jnp.complex64))
-                print(
-                    f"Species {s}: lowest eigenvalues = {eigvals[:self.num_mctdhf_orbitals[s]]}"
-                )
-
-        if C_init is None:
-            # Product states ordered by non-interacting energy
-            ranges = [range(n) for n in self.num_mctdhf_orbitals]
-            product_states = []
-            for indices in itertools.product(*ranges):
-                E_nonint = sum(evals_list[s][n] for s, n in enumerate(indices))
-                product_states.append((E_nonint, indices))
-            product_states.sort(key=lambda x: x[0])
-
-            C_init = np.zeros((self.num_states,) + tuple(self.num_mctdhf_orbitals))
-            for state_idx in range(min(self.num_states, len(product_states))):
-                _, indices = product_states[state_idx]
-                C_init[(state_idx,) + indices] = 1.0
-            C_init = jnp.array(C_init, dtype=jnp.complex64)
-
-        # Add noise to initial guesses and re-orthonormalize
-        rng = np.random.default_rng(42)
-        if noise_C > 0:
-            C_init = C_init + noise_C * jnp.array(
-                rng.standard_normal(C_init.shape), dtype=jnp.complex64
-            )
-            C_init = self.ortonorm_C(C_init)
-        if noise_bs > 0:
-            bs_init_list = [
-                self.ortonorm_b(
-                    b
-                    + noise_bs
-                    * jnp.array(rng.standard_normal(b.shape), dtype=jnp.complex64)
-                )
-                for b in bs_init_list
-            ]
-
-        y_init = self._Cb_to_y(C_init, bs_init_list)
-        t = t_init
-        y = y_init
-        do_normalize = normalize or self.imag_time
-
-        def step_fn(carry, _):
-            t, y = carry
-            t, y = integrator(t, y)
-            if do_normalize:
-                C, bs = self._y_to_Cb(y)
-                C = self.ortonorm_C(C)
-                bs_new = [self.ortonorm_b(b) for b in bs]
-                y = self._Cb_to_y(C, bs_new)
-            return (t, y), (t, y)
-
-        _, (ts_arr, ys_arr) = jax.lax.scan(step_fn, (t, y), None, length=num_steps)
-
-        # Prepend initial values
-        ts = jnp.concatenate([jnp.array([t_init]), ts_arr])
-        ys = jnp.concatenate([y_init[None, :], ys_arr])
-        return ts, ys
 
 
 # ── DVR specialization ────────────────────────────────────────────────────
