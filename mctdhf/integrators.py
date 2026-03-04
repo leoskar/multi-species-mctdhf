@@ -492,3 +492,86 @@ def get_vmf_integrator(mctdh, dt, num_newton=3, solver_tol=1e-8, max_solver_iter
         return t + dt, z
 
     return integrate
+
+
+def diffrax_integrate(
+    mctdh,
+    t0,
+    t1,
+    y0,
+    dt0=None,
+    save_ts=None,
+    num_save=100,
+    solver=None,
+    rtol=1e-6,
+    atol=1e-8,
+    max_steps=16**4,
+):
+    """Adaptive VMF integration using diffrax.
+
+    Uses the full coupled RHS (mctdh.__call__) with an adaptive ODE solver.
+    No CMF splitting error, no frozen mean fields. Step size is controlled
+    automatically based on local error estimates.
+
+    Best suited for real-time evolution (RTE) where:
+    - Adaptive stepping efficiently handles varying dynamics
+    - Norm is conserved by the equations (no normalization needed)
+    - The absence of splitting error allows accurate long-time propagation
+
+    For imaginary time evolution (ITE), use the fixed-step CMF integrators
+    with explicit normalization instead.
+
+    Args:
+        mctdh: MCTDHF_n_species instance.
+        t0: Start time.
+        t1: End time.
+        y0: Initial state vector (packed).
+        dt0: Initial step size guess. Defaults to (t1-t0)/100.
+        save_ts: Array of times at which to save the solution. If None,
+                 saves at num_save evenly-spaced points.
+        num_save: Number of evenly-spaced save points (used if save_ts is
+                  None). Default 100.
+        solver: diffrax solver instance (e.g. diffrax.Tsit5(),
+                diffrax.Dopri5()). Defaults to Tsit5.
+        rtol: Relative tolerance for step-size control.
+        atol: Absolute tolerance for step-size control.
+        max_steps: Maximum number of internal steps.
+
+    Returns:
+        ts: Save times, shape (num_save,).
+        ys: State vectors at save times, shape (num_save, dim_y).
+    """
+    import diffrax
+
+    if solver is None or solver == "explicit":
+        solver = diffrax.Tsit5()
+    elif solver == "implicit":
+        solver = diffrax.Kvaerno5()
+    elif isinstance(solver, str):
+        raise ValueError("Invalid solver string. Use 'explicit' or 'implicit'.")
+
+    if dt0 is None:
+        dt0 = (t1 - t0) / 100
+
+    term = diffrax.ODETerm(lambda t, y, args: mctdh(t, y))
+
+    stepsize_controller = diffrax.PIDController(rtol=rtol, atol=atol)
+
+    if save_ts is None:
+        save_ts = jnp.linspace(t0, t1, num_save)
+
+    saveat = diffrax.SaveAt(ts=save_ts)
+
+    sol = diffrax.diffeqsolve(
+        term,
+        solver,
+        t0=t0,
+        t1=t1,
+        dt0=dt0,
+        y0=y0,
+        stepsize_controller=stepsize_controller,
+        saveat=saveat,
+        max_steps=max_steps,
+    )
+
+    return sol.ts, sol.ys

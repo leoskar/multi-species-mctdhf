@@ -18,6 +18,18 @@ With CUDA support:
 pip install "mctdhf-n-species[cuda12] @ git+ssh://git@github.com/leoskar/n-species-mctdh.git"
 ```
 
+With adaptive ODE solvers (diffrax):
+
+```bash
+pip install "mctdhf-n-species[adaptive] @ git+ssh://git@github.com/leoskar/n-species-mctdh.git"
+```
+
+With both CUDA support and adaptive solvers:
+
+```bash
+pip install "mctdhf-n-species[cuda12,adaptive] @ git+ssh://git@github.com/leoskar/n-species-mctdh.git"
+```
+
 ## Dependencies
 
 - JAX (≥ 0.4)
