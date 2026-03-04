@@ -222,8 +222,8 @@ def _compute_density_quantities(mctdh, C):
     Ds = mctdh.dCI.get_1p_RDMs(C)
     ds = mctdh.dCI.get_2p_RDMs(C)
 
-    Ds = [jnp.sum(D, axis=0) for D in Ds]
-    ds = {k: jnp.sum(v, axis=0) for k, v in ds.items()}
+    Ds = [mctdh._state_average(D) for D in Ds]
+    ds = {k: mctdh._state_average(v) for k, v in ds.items()}
 
     D_invs = []
     for s in range(mctdh.num_species):
@@ -421,5 +421,74 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
         )
 
         return t + dt, mctdh._Cb_to_y(C_new, bs_new)
+
+    return integrate
+
+
+def get_vmf_integrator(mctdh, dt, num_newton=3, solver_tol=1e-8, max_solver_iter=50):
+    """Variable Mean Field integrator using implicit midpoint + Newton-Krylov.
+
+    Uses the implicit midpoint rule, which is symplectic (preserves norm
+    in RTE) and A-stable (handles stiffness). The nonlinear implicit
+    equation is solved with Newton-Krylov iterations using JAX's forward-
+    mode AD (jvp) for matrix-free Jacobian-vector products.
+
+    Unlike the CMF integrators, this has NO splitting error — mean fields
+    are always evaluated at the current state. The implicit midpoint rule
+    also preserves quadratic invariants (norm, energy), making it ideal
+    for real-time propagation.
+
+    Trade-off: each step is more expensive than CMF (Newton iterations
+    with Krylov solves), but the absence of splitting error and symplectic
+    structure often allow significantly larger dt.
+
+    Args:
+        mctdh: MCTDHF_n_species instance. Its __call__ method is used as
+               the full (coupled) RHS.
+        dt: Time step.
+        num_newton: Number of Newton iterations per step.
+        solver_tol: BiCGSTAB convergence tolerance for Newton linear systems.
+        max_solver_iter: Maximum BiCGSTAB iterations per Newton step.
+
+    Returns:
+        integrate: Function integrate(t, y) -> (t_new, y_new).
+    """
+    t_half = dt / 2
+
+    @jax.jit
+    def integrate(t, y):
+        t_mid = t + t_half
+
+        # Initial guess: explicit Euler
+        f0 = mctdh(t, y)
+        z = y + dt * f0
+
+        # Newton iterations to solve the implicit midpoint equation:
+        #   G(z) = z - y - dt * f(t_mid, (z + y)/2) = 0
+        #
+        # Newton update: G'(z) · δz = -G(z)
+        #   G'(z) · v = v - (dt/2) · J_f(y_mid) · v
+        # where J_f · v is computed via jax.jvp.
+        def newton_step(z, _):
+            y_mid = (z + y) / 2
+            f_mid = mctdh(t_mid, y_mid)
+            residual = z - y - dt * f_mid
+
+            def matvec(v):
+                _, Jv = jax.jvp(lambda yy: mctdh(t_mid, yy), (y_mid,), (v,))
+                return v - t_half * Jv
+
+            dz, _ = jax.scipy.sparse.linalg.bicgstab(
+                matvec,
+                -residual,
+                x0=jnp.zeros_like(residual),
+                tol=solver_tol,
+                maxiter=max_solver_iter,
+            )
+            return z + dz, None
+
+        z, _ = jax.lax.scan(newton_step, z, None, length=num_newton)
+
+        return t + dt, z
 
     return integrate
