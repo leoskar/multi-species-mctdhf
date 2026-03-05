@@ -512,6 +512,10 @@ def diffrax_integrate(
     No CMF splitting error, no frozen mean fields. Step size is controlled
     automatically based on local error estimates.
 
+    Complex state vectors are split into stacked real/imaginary float32
+    parts to avoid diffrax's complex dtype limitations and to keep the
+    same memory footprint as complex64.
+
     Best suited for real-time evolution (RTE) where:
     - Adaptive stepping efficiently handles varying dynamics
     - Norm is conserved by the equations (no normalization needed)
@@ -524,21 +528,21 @@ def diffrax_integrate(
         mctdh: MCTDHF_n_species instance.
         t0: Start time.
         t1: End time.
-        y0: Initial state vector (packed).
+        y0: Initial state vector (packed, complex64 or float32).
         dt0: Initial step size guess. Defaults to (t1-t0)/100.
         save_ts: Array of times at which to save the solution. If None,
                  saves at num_save evenly-spaced points.
         num_save: Number of evenly-spaced save points (used if save_ts is
                   None). Default 100.
-        solver: diffrax solver instance (e.g. diffrax.Tsit5(),
-                diffrax.Dopri5()). Defaults to Tsit5.
+        solver: diffrax solver instance, or 'explicit' (Tsit5) /
+                'implicit' (Kvaerno5). Defaults to Tsit5.
         rtol: Relative tolerance for step-size control.
         atol: Absolute tolerance for step-size control.
         max_steps: Maximum number of internal steps.
 
     Returns:
         ts: Save times, shape (num_save,).
-        ys: State vectors at save times, shape (num_save, dim_y).
+        ys: Complex state vectors at save times, shape (num_save, dim_y).
     """
     import diffrax
 
@@ -552,7 +556,28 @@ def diffrax_integrate(
     if dt0 is None:
         dt0 = (t1 - t0) / 100
 
-    term = diffrax.ODETerm(lambda t, y, args: mctdh(t, y))
+    is_complex = jnp.iscomplexobj(y0)
+    n = y0.shape[0]
+
+    if is_complex:
+        # Split complex64 → stacked float32 [real | imag]
+        y0_real = jnp.concatenate(
+            [y0.real.astype(jnp.float32), y0.imag.astype(jnp.float32)]
+        )
+
+        def rhs_real(t, y_real, args):
+            y_complex = y_real[:n] + 1j * y_real[n:]
+            y_complex = y_complex.astype(jnp.complex64)
+            dy = mctdh(t, y_complex)
+            return jnp.concatenate(
+                [dy.real.astype(jnp.float32), dy.imag.astype(jnp.float32)]
+            )
+
+        term = diffrax.ODETerm(rhs_real)
+        y0_solve = y0_real
+    else:
+        term = diffrax.ODETerm(lambda t, y, args: mctdh(t, y))
+        y0_solve = y0
 
     stepsize_controller = diffrax.PIDController(rtol=rtol, atol=atol)
 
@@ -567,10 +592,17 @@ def diffrax_integrate(
         t0=t0,
         t1=t1,
         dt0=dt0,
-        y0=y0,
+        y0=y0_solve,
         stepsize_controller=stepsize_controller,
         saveat=saveat,
         max_steps=max_steps,
     )
 
-    return sol.ts, sol.ys
+    if is_complex:
+        # Recombine float32 → complex64
+        ys = sol.ys[:, :n] + 1j * sol.ys[:, n:]
+        ys = ys.astype(jnp.complex64)
+    else:
+        ys = sol.ys
+
+    return sol.ts, ys
