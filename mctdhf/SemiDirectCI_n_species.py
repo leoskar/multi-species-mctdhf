@@ -45,7 +45,7 @@ class SemiDirectCI_n_species:
     def __init__(
         self,
         num_spatial_orbitals,  # int or list of ints
-        num_particles,         # list of ints [N_0, N_1, ..., N_{k-1}]
+        num_particles,  # list of ints [N_0, N_1, ..., N_{k-1}]
     ):
         self.num_species = len(num_particles)
         self.num_particles = num_particles
@@ -58,11 +58,11 @@ class SemiDirectCI_n_species:
         assert len(self.num_spatial_orbitals) == self.num_species
 
         # Precompute determinant data and excitation operators per species
-        self.I = []          # Slater determinants (boolean occupation vectors)
-        self.W = []          # Vertex weights for address computation
+        self.I = []  # Slater determinants (boolean occupation vectors)
+        self.W = []  # Vertex weights for address computation
         self.num_dets = []
-        self.E_pq = []       # 1-body excitation tensors
-        self.E_pqrs = []     # 2-body excitation tensors
+        self.E_pq = []  # 1-body excitation tensors
+        self.E_pqrs = []  # 2-body excitation tensors
 
         # Precompute data for each species
         for s in range(self.num_species):
@@ -84,8 +84,8 @@ class SemiDirectCI_n_species:
 
         # Convert to JAX arrays once — avoids repeated implicit transfers in
         # JIT-compiled methods that use opt_einsum with backend="jax"
-        self.E_pq = [jnp.array(e) for e in self.E_pq]
-        self.E_pqrs = [jnp.array(e) for e in self.E_pqrs]
+        self.E_pq = [jnp.array(e, dtype=jnp.float32) for e in self.E_pq]
+        self.E_pqrs = [jnp.array(e, dtype=jnp.float32) for e in self.E_pqrs]
 
     # ── Determinant enumeration and addressing ────────────────────────────
 
@@ -101,9 +101,13 @@ class SemiDirectCI_n_species:
         elif num_electrons == num_orbitals:
             dets.append(np.ones(num_orbitals))
         else:
-            for d in SemiDirectCI_n_species.get_slater_dets(num_orbitals - 1, num_electrons):
+            for d in SemiDirectCI_n_species.get_slater_dets(
+                num_orbitals - 1, num_electrons
+            ):
                 dets.append(np.concatenate((d, [0])))
-            for d in SemiDirectCI_n_species.get_slater_dets(num_orbitals - 1, num_electrons - 1):
+            for d in SemiDirectCI_n_species.get_slater_dets(
+                num_orbitals - 1, num_electrons - 1
+            ):
                 dets.append(np.concatenate((d, [1])))
         return np.array(dets, dtype=bool)
 
@@ -196,7 +200,7 @@ class SemiDirectCI_n_species:
 
     # ── Einsum index helpers ──────────────────────────────────────────────
 
-    def _species_indices(self, s, out_char='x'):
+    def _species_indices(self, s, out_char="x"):
         """Build einsum index strings for contracting an operator on species s.
 
         Returns
@@ -286,7 +290,7 @@ class SemiDirectCI_n_species:
         # Step 3: contract with C
         c_indices = [chr(97 + i) for i in range(self.num_species)]
         in1_char, in2_char = c_indices[s1], c_indices[s2]
-        out1_char, out2_char = 'A', 'B'
+        out1_char, out2_char = "A", "B"
 
         op_str = out1_char + in1_char + out2_char + in2_char
         c_str = "".join(c_indices)
@@ -310,8 +314,8 @@ class SemiDirectCI_n_species:
         """
         c_indices = [chr(97 + i) for i in range(self.num_species)]
         c_conj_indices = list(c_indices)
-        c_conj_indices[s] = 'x'  # conjugate index
-        c_indices[s] = 'y'
+        c_conj_indices[s] = "x"  # conjugate index
+        c_indices[s] = "y"
 
         rho_ci_str = f"...{''.join(c_conj_indices)},...{''.join(c_indices)}->...xy"
         return contract(rho_ci_str, C.conj(), C, backend="jax")
@@ -352,23 +356,29 @@ class SemiDirectCI_n_species:
                     rho_ci = self._compute_rho_ci(C, s1)
                     d_intra = contract(
                         "ijpqrs, ...ij -> ...pqrs",
-                        self.E_pqrs[s1], rho_ci, backend="jax"
+                        self.E_pqrs[s1],
+                        rho_ci,
+                        backend="jax",
                     )
                     ds[(s1, s1)] = d_intra
                 else:
                     # Inter-species: contract over all indices except s1 and s2
                     idx_conj = [chr(97 + i) for i in range(self.num_species)]
                     idx_norm = [chr(97 + i) for i in range(self.num_species)]
-                    idx_conj[s1], idx_conj[s2] = 'x', 'z'
-                    idx_norm[s1], idx_norm[s2] = 'y', 'w'
+                    idx_conj[s1], idx_conj[s2] = "x", "z"
+                    idx_norm[s1], idx_norm[s2] = "y", "w"
 
-                    rho_pair_str = f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
+                    rho_pair_str = (
+                        f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
+                    )
                     rho_pair = contract(rho_pair_str, C.conj(), C, backend="jax")
 
                     d_inter = contract(
                         "...xzyw, xypr, zwqs -> ...pqrs",
-                        rho_pair, self.E_pq[s1], self.E_pq[s2],
-                        backend="jax"
+                        rho_pair,
+                        self.E_pq[s1],
+                        self.E_pq[s2],
+                        backend="jax",
                     )
                     ds[(s1, s2)] = d_inter
 
