@@ -606,3 +606,111 @@ def diffrax_integrate(
         ys = sol.ys
 
     return sol.ts, ys
+
+
+def diffrax_integrate_imex(
+    mctdh,
+    t0,
+    t1,
+    y0,
+    dt0=None,
+    save_ts=None,
+    num_save=100,
+    rtol=1e-6,
+    atol=1e-8,
+    max_steps=16**4,
+):
+    """Adaptive IMEX integration using diffrax Sil3.
+
+    Splits the RHS into:
+    - Implicit (stiff): orbital one-body (1-P)h·b — high-energy kinetic modes
+    - Explicit (non-stiff): CI + orbital two-body mean-field contributions
+
+    This treats the stiff kinetic operator implicitly (no stability restriction)
+    while handling the nonlinear mean-field coupling explicitly (cheap, accurate).
+    No CMF splitting error since both terms are evaluated at the current state.
+
+    Complex states are split into real/imaginary float32 parts for diffrax
+    compatibility.
+
+    Args:
+        mctdh: MCTDHF_n_species instance with _rhs_implicit and _rhs_explicit.
+        t0: Start time.
+        t1: End time.
+        y0: Initial state vector (packed, complex64 or float32).
+        dt0: Initial step size guess. Defaults to (t1-t0)/100.
+        save_ts: Array of times to save. If None, num_save evenly-spaced.
+        num_save: Number of save points (default 100).
+        rtol: Relative tolerance.
+        atol: Absolute tolerance.
+        max_steps: Maximum internal steps.
+
+    Returns:
+        ts: Save times, shape (num_save,).
+        ys: Complex state vectors, shape (num_save, dim_y).
+    """
+    import diffrax
+
+    if dt0 is None:
+        dt0 = (t1 - t0) / 100
+
+    is_complex = jnp.iscomplexobj(y0)
+    n = y0.shape[0]
+
+    if is_complex:
+        y0_real = jnp.concatenate(
+            [y0.real.astype(jnp.float32), y0.imag.astype(jnp.float32)]
+        )
+
+        def _to_complex(y_real):
+            return (y_real[:n] + 1j * y_real[n:]).astype(jnp.complex64)
+
+        def _to_real(dy):
+            return jnp.concatenate(
+                [dy.real.astype(jnp.float32), dy.imag.astype(jnp.float32)]
+            )
+
+        def rhs_implicit_real(t, y_real, args):
+            return _to_real(mctdh._rhs_implicit(t, _to_complex(y_real)))
+
+        def rhs_explicit_real(t, y_real, args):
+            return _to_real(mctdh._rhs_explicit(t, _to_complex(y_real)))
+
+        terms = diffrax.MultiTerm(
+            diffrax.ODETerm(rhs_explicit_real),
+            diffrax.ODETerm(rhs_implicit_real),
+        )
+        y0_solve = y0_real
+    else:
+        terms = diffrax.MultiTerm(
+            diffrax.ODETerm(lambda t, y, args: mctdh._rhs_explicit(t, y)),
+            diffrax.ODETerm(lambda t, y, args: mctdh._rhs_implicit(t, y)),
+        )
+        y0_solve = y0
+
+    solver = diffrax.Sil3()
+    stepsize_controller = diffrax.PIDController(rtol=rtol, atol=atol)
+
+    if save_ts is None:
+        save_ts = jnp.linspace(t0, t1, num_save)
+
+    saveat = diffrax.SaveAt(ts=save_ts)
+
+    sol = diffrax.diffeqsolve(
+        terms,
+        solver,
+        t0=t0,
+        t1=t1,
+        dt0=dt0,
+        y0=y0_solve,
+        stepsize_controller=stepsize_controller,
+        saveat=saveat,
+        max_steps=max_steps,
+    )
+
+    if is_complex:
+        ys = (sol.ys[:, :n] + 1j * sol.ys[:, n:]).astype(jnp.complex64)
+    else:
+        ys = sol.ys
+
+    return sol.ts, ys

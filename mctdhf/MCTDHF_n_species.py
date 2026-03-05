@@ -397,6 +397,75 @@ class MCTDHF_n_species:
         D_inv_64 = (eigvecs_64 / (eigvals_64 + self.eps)) @ eigvecs_64.conj().T
         return D_inv_64.astype(jnp.complex64)
 
+    @partial(jit, static_argnums=0)
+    def _rhs_implicit(self, t, y):
+        """Stiff (implicit) part of the RHS for IMEX splitting.
+
+        Contains only the orbital one-body contribution (1-P)h·b_s per
+        species. This is the main source of stiffness from high-energy
+        kinetic modes. The CI coefficients are not modified by this term.
+
+        Satisfies: __call__(t, y) = _rhs_implicit(t, y) + _rhs_explicit(t, y)
+        """
+        C, bs = self._y_to_Cb(y)
+        h_current = self._get_h_current(t)
+
+        C_dot = jnp.zeros_like(C)
+
+        b_dots = []
+        for s in range(self.num_species):
+            h_1 = h_current[s] @ bs[s]
+            P = bs[s] @ bs[s].conj().T
+            h_3 = P @ h_1
+            b_dot = -(h_1 - h_3) if self.imag_time else -1j * (h_1 - h_3)
+            b_dots.append(b_dot)
+
+        return self._Cb_to_y(C_dot, b_dots)
+
+    @partial(jit, static_argnums=0)
+    def _rhs_explicit(self, t, y):
+        """Non-stiff (explicit) part of the RHS for IMEX splitting.
+
+        Contains the full CI RHS (H_CI · C) and the orbital two-body
+        mean-field contributions (D⁻¹ Σ_k d_{sk} (1-P) W_k). These
+        terms are nonlinear but typically less stiff than the one-body
+        kinetic operator.
+
+        Satisfies: __call__(t, y) = _rhs_implicit(t, y) + _rhs_explicit(t, y)
+        """
+        C, bs = self._y_to_Cb(y)
+        h_current = self._get_h_current(t)
+
+        # CI RHS (full — includes both 1-body and 2-body in the CI Hamiltonian)
+        h_MO_list = [
+            self.transform_h(h_current[s], bs[s])[1] for s in range(self.num_species)
+        ]
+        g_MO_dict, g_mix_tensors = self._transform_all_g(bs, full=True)
+        C_dot = self._rhs_C_linear(C, h_MO_list, g_MO_dict)
+
+        # Orbital 2-body mean-field only
+        Ds = self.dCI.get_1p_RDMs(C)
+        ds = self.dCI.get_2p_RDMs(C)
+        Ds = [self._state_average(D) for D in Ds]
+        ds = {k: self._state_average(v) for k, v in ds.items()}
+
+        b_dots = []
+        for s in range(self.num_species):
+            D_inv = self._invert_density_matrix(Ds[s])
+            b_dot = jnp.zeros_like(bs[s])
+
+            for k in range(self.num_species):
+                if (s, k) in g_mix_tensors:
+                    g_3, g_5 = g_mix_tensors[(s, k)]
+                    d_sk = ds[(s, k)]
+                    b_dot = b_dot + contract(
+                        "np, pqrs, iqrs -> in", D_inv, d_sk, g_3 - g_5, backend="jax"
+                    )
+
+            b_dots.append(-b_dot if self.imag_time else -1j * b_dot)
+
+        return self._Cb_to_y(C_dot, b_dots)
+
     # ── Orthonormalization ────────────────────────────────────────────────
 
     @partial(jit, static_argnums=0)
