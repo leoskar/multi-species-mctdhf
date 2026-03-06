@@ -410,11 +410,63 @@ class MCTDHF_n_species:
         """
         return contract("rm, pqrs, sn -> pqmn", b_k.conj(), g, b_k, backend="jax")
 
-    def _compute_K_rhs(self, K_s, s, bs, h_current):
-        """Compute dK_s/dt for the PSI K-step.
+    def _precompute_K_integrals(self, s, bs, h_current):
+        """Precompute transformed integrals for the PSI K-step.
 
-        K_s has shape (num_states, M_0, ..., M_{s-1}, N_spatial_s, M_{s+1}, ..., M_{N-1})
-        where the spatial axis replaces the MO axis for species s at position s+1.
+        These depend only on bs and h_current (not on K_s), so they can be
+        computed once and reused across RK4 sub-steps.
+
+        Returns
+        -------
+        h_s : jnp.ndarray
+            1-body Hamiltonian for species s in spatial basis.
+        h_MO_others : list of (int, jnp.ndarray)
+            (k, h_k_MO) pairs for k ≠ s.
+        W_list : list of (int, jnp.ndarray)
+            (k, W_sk) partially transformed interaction pairs.
+        g_MO_list : list of (int, int, jnp.ndarray)
+            (k, l, g_kl_MO) fully transformed pairs (N ≥ 3 only).
+        """
+        N = self.num_species
+
+        h_MO_others = []
+        for k in range(N):
+            if k == s:
+                continue
+            _, h_k_MO, _ = self.transform_h(h_current[k], bs[k])
+            h_MO_others.append((k, h_k_MO))
+
+        W_list = []
+        for k in range(N):
+            if k == s:
+                continue
+            if (s, k) in self.g_dict:
+                g_sk = self.g_dict[(s, k)]
+            elif (k, s) in self.g_dict:
+                g_sk = self._transpose_g(self.g_dict[(k, s)])
+            else:
+                continue
+            W_list.append((k, self._partial_transform_g(g_sk, bs[k])))
+
+        g_MO_list = []
+        if N >= 3:
+            for k in range(N):
+                for l in range(k + 1, N):
+                    if k == s or l == s:
+                        continue
+                    if (k, l) in self.g_dict:
+                        g_spatial = self.g_dict[(k, l)]
+                    elif (l, k) in self.g_dict:
+                        g_spatial = self._transpose_g(self.g_dict[(l, k)])
+                    else:
+                        continue
+                    _, g_kl_MO, _ = self.transform_g(g_spatial, bs[k], bs[l])
+                    g_MO_list.append((k, l, g_kl_MO))
+
+        return h_current[s], h_MO_others, W_list, g_MO_list
+
+    def _apply_K_hamiltonian(self, K_s, s, h_s, h_MO_others, W_list, g_MO_list):
+        """Apply the effective Hamiltonian to K_s using precomputed integrals.
 
         Parameters
         ----------
@@ -422,10 +474,8 @@ class MCTDHF_n_species:
             Single-hole function for species s.
         s : int
             Species index.
-        bs : list of jnp.ndarray
-            Current orbital coefficient matrices.
-        h_current : list of jnp.ndarray
-            1-body Hamiltonians in spatial basis.
+        h_s, h_MO_others, W_list, g_MO_list :
+            Precomputed integrals from _precompute_K_integrals.
 
         Returns
         -------
@@ -435,96 +485,55 @@ class MCTDHF_n_species:
         N = self.num_species
         factor = -1.0 if self.imag_time else -1j
 
-        # Build einsum index letters for CI axes + spatial axis
-        # K_s axes: [state, dim_0, ..., dim_{s-1}, x_s, dim_{s+1}, ..., dim_{N-1}]
-        # Use letters: a=state, then b,c,d,... for the N mode axes
-        idx = [chr(98 + k) for k in range(N)]  # b, c, d, ...
+        idx = [chr(98 + k) for k in range(N)]
         state_char = "a"
-        spatial_char = idx[s]  # the axis at position s is the spatial one
-
-        # Full K_s index string
+        spatial_char = idx[s]
         k_str = state_char + "".join(idx)
 
-        result = jnp.zeros_like(K_s)
-
         # 1. h_s @ K_s — 1-body spatial operator on species s axis
-        out_char = chr(98 + N)  # next unused letter
+        out_char = chr(98 + N)
         out_idx = list(idx)
         out_idx[s] = out_char
         out_str = state_char + "".join(out_idx)
         op_str = f"{out_char}{spatial_char}"
-        einsum_1body_s = f"{op_str},{k_str}->{out_str}"
-        result = result + contract(einsum_1body_s, h_current[s], K_s, backend="jax")
+        result = contract(f"{op_str},{k_str}->{out_str}", h_s, K_s, backend="jax")
 
-        # 2. Σ_{k≠s} K_s ×_k h_k_MO — 1-body MO for other species
-        for k in range(N):
-            if k == s:
-                continue
-            _, h_k_MO, _ = self.transform_h(h_current[k], bs[k])
-            mo_char = idx[k]
+        # 2. Σ_{k≠s} K_s ×_k h_k_MO
+        for k, h_k_MO in h_MO_others:
             out_char_k = chr(98 + N)
             out_idx_k = list(idx)
             out_idx_k[k] = out_char_k
             out_str_k = state_char + "".join(out_idx_k)
-            op_str_k = f"{out_char_k}{mo_char}"
-            einsum_1body_k = f"{op_str_k},{k_str}->{out_str_k}"
-            result = result + contract(einsum_1body_k, h_k_MO, K_s, backend="jax")
+            op_str_k = f"{out_char_k}{idx[k]}"
+            result = result + contract(
+                f"{op_str_k},{k_str}->{out_str_k}", h_k_MO, K_s, backend="jax"
+            )
 
-        # 3. Σ_{k≠s} W_sk interaction (spatial for s, MO for k)
-        for k in range(N):
-            if k == s:
-                continue
-            # Get spatial g for pair (s, k)
-            if (s, k) in self.g_dict:
-                g_sk = self.g_dict[(s, k)]
-            elif (k, s) in self.g_dict:
-                g_sk = self._transpose_g(self.g_dict[(k, s)])
-            else:
-                continue
-
-            # W_sk: shape (N_spatial_s, N_spatial_s, M_k, M_k)
-            W_sk = self._partial_transform_g(g_sk, bs[k])
-
-            # Contract W_sk with K_s on axes (spatial_s, mo_k)
-            # W indices: (p, x_s, m, n_k) where p→new spatial, x_s→old spatial,
-            #            m→new MO_k, n_k→old MO_k
-            w_p = chr(98 + N)  # new spatial for s
-            w_q = chr(98 + N + 1)  # new MO for k
+        # 3. Σ_{k≠s} W_sk interaction
+        for k, W_sk in W_list:
+            w_p = chr(98 + N)
+            w_q = chr(98 + N + 1)
             w_str = f"{w_p}{spatial_char}{w_q}{idx[k]}"
             out_idx_w = list(idx)
             out_idx_w[s] = w_p
             out_idx_w[k] = w_q
             out_str_w = state_char + "".join(out_idx_w)
-            einsum_2body = f"{w_str},{k_str}->{out_str_w}"
-            result = result + contract(einsum_2body, W_sk, K_s, backend="jax")
+            result = result + contract(
+                f"{w_str},{k_str}->{out_str_w}", W_sk, K_s, backend="jax"
+            )
 
-        # 4. Σ_{k<l, k≠s, l≠s} g_kl_MO fully transformed (only for N≥3)
-        if N >= 3:
-            for k in range(N):
-                for l in range(k + 1, N):
-                    if k == s or l == s:
-                        continue
-                    # Get fully transformed g_kl_MO
-                    if (k, l) in self.g_dict:
-                        g_spatial = self.g_dict[(k, l)]
-                    elif (l, k) in self.g_dict:
-                        g_spatial = self._transpose_g(self.g_dict[(l, k)])
-                    else:
-                        continue
-
-                    _, g_kl_MO, _ = self.transform_g(g_spatial, bs[k], bs[l])
-
-                    # Contract g_kl_MO (shape M_k, M_l, M_k, M_l) with K_s
-                    # on axes k and l
-                    g_p = chr(98 + N)  # new MO for k
-                    g_q = chr(98 + N + 1)  # new MO for l
-                    g_str = f"{g_p}{g_q}{idx[k]}{idx[l]}"
-                    out_idx_g = list(idx)
-                    out_idx_g[k] = g_p
-                    out_idx_g[l] = g_q
-                    out_str_g = state_char + "".join(out_idx_g)
-                    einsum_g = f"{g_str},{k_str}->{out_str_g}"
-                    result = result + contract(einsum_g, g_kl_MO, K_s, backend="jax")
+        # 4. Σ_{k<l, k≠s, l≠s} g_kl_MO (N ≥ 3 only)
+        for k, l, g_kl_MO in g_MO_list:
+            g_p = chr(98 + N)
+            g_q = chr(98 + N + 1)
+            g_str = f"{g_p}{g_q}{idx[k]}{idx[l]}"
+            out_idx_g = list(idx)
+            out_idx_g[k] = g_p
+            out_idx_g[l] = g_q
+            out_str_g = state_char + "".join(out_idx_g)
+            result = result + contract(
+                f"{g_str},{k_str}->{out_str_g}", g_kl_MO, K_s, backend="jax"
+            )
 
         return factor * result
 

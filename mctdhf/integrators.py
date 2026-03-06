@@ -535,6 +535,7 @@ def get_psi_integrator(mctdh, dt):
 
     N_spatials = list(mctdh.num_spatial_orbitals)
 
+    @jax.jit
     def integrate(t, y):
         C, bs = mctdh._y_to_Cb(y)
         h_current = mctdh._get_h_current(t)
@@ -556,11 +557,14 @@ def get_psi_integrator(mctdh, dt):
             einsum_form_K = f"{b_str},{c_str}->{k_str}"
             K_s = contract(einsum_form_K, bs[s], C, backend="jax")
 
+            # Precompute integrals once (depend on bs, not K_s)
+            K_integrals = mctdh._precompute_K_integrals(s, bs, h_current)
+
             # Propagate K_s forward by dt (RK4)
-            k1 = mctdh._compute_K_rhs(K_s, s, bs, h_current)
-            k2 = mctdh._compute_K_rhs(K_s + dt / 2 * k1, s, bs, h_current)
-            k3 = mctdh._compute_K_rhs(K_s + dt / 2 * k2, s, bs, h_current)
-            k4 = mctdh._compute_K_rhs(K_s + dt * k3, s, bs, h_current)
+            k1 = mctdh._apply_K_hamiltonian(K_s, s, *K_integrals)
+            k2 = mctdh._apply_K_hamiltonian(K_s + dt / 2 * k1, s, *K_integrals)
+            k3 = mctdh._apply_K_hamiltonian(K_s + dt / 2 * k2, s, *K_integrals)
+            k4 = mctdh._apply_K_hamiltonian(K_s + dt * k3, s, *K_integrals)
             K_s_new = K_s + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
 
             # QR decompose: reshape K to (N_spatial_s, D) where D = ∏_{k≠s} M_k
