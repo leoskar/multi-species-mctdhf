@@ -493,6 +493,140 @@ def get_vmf_integrator(mctdh, dt, num_newton=3, solver_tol=1e-8, max_solver_iter
     return integrate
 
 
+def get_psi_integrator(mctdh, dt):
+    """Projector-Splitting Integrator (PSI) for 1-particle-per-species MCTDHF.
+
+    Implements a first-order Lie-Trotter splitting that bypasses the density
+    matrix inverse D⁻¹. Provides exact norm conservation (up to time
+    discretization) via QR decomposition.
+
+    Requires num_states=1 and all M_s equal (Tucker rank constraint).
+
+    Args:
+        mctdh: MCTDHF_n_species instance (1 particle per species).
+        dt: Time step.
+
+    Returns:
+        integrate: Function integrate(t, y) -> (t_new, y_new).
+    """
+    import numpy as np
+
+    N = mctdh.num_species
+    Ms = list(mctdh.num_mctdhf_orbitals)
+
+    # Validate constraints
+    if mctdh.num_states != 1:
+        raise ValueError(f"PSI requires num_states=1, got {mctdh.num_states}")
+    for s in range(N):
+        if mctdh.num_particles[s] != 1:
+            raise ValueError(
+                f"PSI requires 1 particle per species, "
+                f"species {s} has {mctdh.num_particles[s]}"
+            )
+
+    # Validate rank constraint: ∏_{k≠s} M_k == M_s for all s
+    for s in range(N):
+        D = int(np.prod([Ms[k] for k in range(N) if k != s]))
+        if D != Ms[s]:
+            raise ValueError(
+                f"PSI rank constraint violated for species {s}: "
+                f"product of other M_k = {D} != M_{s} = {Ms[s]}"
+            )
+
+    N_spatials = list(mctdh.num_spatial_orbitals)
+
+    def integrate(t, y):
+        C, bs = mctdh._y_to_Cb(y)
+        h_current = mctdh._get_h_current(t)
+
+        for s in range(N):
+            # ── K-step (forward, +dt) ────────────────────────────────
+            # Form K_s by contracting C with b_s along mode s.
+            # C shape: (1, M_0, ..., M_{N-1})
+            # b_s shape: (N_spatial_s, M_s)
+            # K_s shape: (1, M_0, ..., M_{s-1}, N_spatial_s, M_{s+1}, ..., M_{N-1})
+            idx = [chr(98 + k) for k in range(N)]  # b, c, d, ...
+            c_str = "a" + "".join(idx)
+
+            new_char = chr(98 + N)  # next unused
+            k_idx = list(idx)
+            k_idx[s] = new_char
+            k_str = "a" + "".join(k_idx)
+            b_str = f"{new_char}{idx[s]}"
+            einsum_form_K = f"{b_str},{c_str}->{k_str}"
+            K_s = contract(einsum_form_K, bs[s], C, backend="jax")
+
+            # Propagate K_s forward by dt (RK4)
+            k1 = mctdh._compute_K_rhs(K_s, s, bs, h_current)
+            k2 = mctdh._compute_K_rhs(K_s + dt / 2 * k1, s, bs, h_current)
+            k3 = mctdh._compute_K_rhs(K_s + dt / 2 * k2, s, bs, h_current)
+            k4 = mctdh._compute_K_rhs(K_s + dt * k3, s, bs, h_current)
+            K_s_new = K_s + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+            # QR decompose: reshape K to (N_spatial_s, D) where D = ∏_{k≠s} M_k
+            # The state axis and all non-s mode axes are flattened into D.
+            # First, move the spatial axis (position s+1) to position 1:
+            K_shape = K_s_new.shape  # (1, M_0, ..., N_spatial_s, ..., M_{N-1})
+            # Axes: 0=state, 1..s=modes 0..s-1, s+1=spatial, s+2..N=modes s+1..N-1
+            spatial_ax = s + 1
+            # Move spatial to front (after state), then flatten the rest
+            perm = [spatial_ax] + [i for i in range(0, N + 1) if i != spatial_ax]
+            K_perm = jnp.transpose(K_s_new, perm)
+            # K_perm shape: (1, N_spatial_s, M_0, ..., M_{s-1}, M_{s+1}, ..., M_{N-1})
+            D = int(np.prod([K_perm.shape[i] for i in range(1, N + 1)]))
+            K_mat = K_perm.reshape(N_spatials[s], D)
+
+            # Thin QR
+            Q, R = jnp.linalg.qr(K_mat)
+            # Positive diagonal convention for gauge consistency
+            signs = jnp.sign(jnp.diag(R))
+            signs = jnp.where(signs == 0, 1.0, signs)
+            Q = Q * signs[None, :]
+            R = signs.conj()[:, None] * R
+
+            # New b_s = Q (shape: N_spatial_s × D = N_spatial_s × M_s)
+            bs[s] = Q
+
+            # New C = R reshaped back to tensor form
+            # R shape: (D, D) = (M_s, M_s) ... but we need to reshape
+            # back to the permuted shape then un-permute.
+            # R has shape (D, D) where D = num_states * ∏_{k≠s} M_k
+            # = 1 * M_s = M_s
+            # Reshape R to (1, M_0, ..., M_{s-1}, M_s_new, M_{s+1}, ..., M_{N-1})
+            # where M_s_new is at position 1 in the permuted layout
+            perm_shape = [K_perm.shape[i] for i in range(2, N + 1)]
+            C_perm = R.reshape([Ms[s]] + [1] + perm_shape)
+            # C_perm shape: (1, M_s_new, M_0, ..., M_{s-1}, M_{s+1}, ..., M_{N-1})
+            # Undo the permutation: perm was [0, spatial_ax, other_axes...]
+            # Inverse perm: position i in output came from perm[i] in input
+            inv_perm = [0] * (N + 1)
+            for i, p in enumerate(perm):
+                inv_perm[p] = i
+            C = jnp.transpose(C_perm, inv_perm)
+
+            # ── S-step (backward, -dt) — for s < N-1 only ───────────
+            if s < N - 1:
+                # Transform integrals to new orbital basis
+                h_MO_list = [
+                    mctdh.transform_h(h_current[k], bs[k])[1] for k in range(N)
+                ]
+                g_MO_dict, _ = mctdh._transform_all_g(bs, full=False)
+
+                # Propagate C backward by dt (RK4)
+                def c_rhs(c):
+                    return mctdh._rhs_C_linear(c, h_MO_list, g_MO_dict)
+
+                k1 = c_rhs(C)
+                k2 = c_rhs(C - dt / 2 * k1)
+                k3 = c_rhs(C - dt / 2 * k2)
+                k4 = c_rhs(C - dt * k3)
+                C = C - dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+        return t + dt, mctdh._Cb_to_y(C, bs)
+
+    return integrate
+
+
 def diffrax_integrate(
     mctdh,
     t0,

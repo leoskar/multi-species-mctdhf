@@ -397,6 +397,137 @@ class MCTDHF_n_species:
         D_inv_64 = (eigvecs_64 / (eigvals_64 + self.eps)) @ eigvecs_64.conj().T
         return D_inv_64.astype(jnp.complex64)
 
+    # ── PSI (Projector-Splitting Integrator) helpers ──────────────────────
+
+    @partial(jit, static_argnums=0)
+    def _partial_transform_g(self, g, b_k):
+        """Partially transform 2-body integrals on species k only.
+
+        Returns W_sk with shape (N_spatial_s, N_spatial_s, M_k, M_k):
+        spatial indices for species s, MO indices for species k.
+
+        For 4D integrals: W_sk[p,q,m,n] = Σ_{r,s} b_k*[r,m] g[p,q,r,s] b_k[s,n]
+        """
+        return contract("rm, pqrs, sn -> pqmn", b_k.conj(), g, b_k, backend="jax")
+
+    def _compute_K_rhs(self, K_s, s, bs, h_current):
+        """Compute dK_s/dt for the PSI K-step.
+
+        K_s has shape (num_states, M_0, ..., M_{s-1}, N_spatial_s, M_{s+1}, ..., M_{N-1})
+        where the spatial axis replaces the MO axis for species s at position s+1.
+
+        Parameters
+        ----------
+        K_s : jnp.ndarray
+            Single-hole function for species s.
+        s : int
+            Species index.
+        bs : list of jnp.ndarray
+            Current orbital coefficient matrices.
+        h_current : list of jnp.ndarray
+            1-body Hamiltonians in spatial basis.
+
+        Returns
+        -------
+        dK_dt : jnp.ndarray
+            Time derivative, same shape as K_s.
+        """
+        N = self.num_species
+        factor = -1.0 if self.imag_time else -1j
+
+        # Build einsum index letters for CI axes + spatial axis
+        # K_s axes: [state, dim_0, ..., dim_{s-1}, x_s, dim_{s+1}, ..., dim_{N-1}]
+        # Use letters: a=state, then b,c,d,... for the N mode axes
+        idx = [chr(98 + k) for k in range(N)]  # b, c, d, ...
+        state_char = "a"
+        spatial_char = idx[s]  # the axis at position s is the spatial one
+
+        # Full K_s index string
+        k_str = state_char + "".join(idx)
+
+        result = jnp.zeros_like(K_s)
+
+        # 1. h_s @ K_s — 1-body spatial operator on species s axis
+        out_char = chr(98 + N)  # next unused letter
+        out_idx = list(idx)
+        out_idx[s] = out_char
+        out_str = state_char + "".join(out_idx)
+        op_str = f"{out_char}{spatial_char}"
+        einsum_1body_s = f"{op_str},{k_str}->{out_str}"
+        result = result + contract(einsum_1body_s, h_current[s], K_s, backend="jax")
+
+        # 2. Σ_{k≠s} K_s ×_k h_k_MO — 1-body MO for other species
+        for k in range(N):
+            if k == s:
+                continue
+            _, h_k_MO, _ = self.transform_h(h_current[k], bs[k])
+            mo_char = idx[k]
+            out_char_k = chr(98 + N)
+            out_idx_k = list(idx)
+            out_idx_k[k] = out_char_k
+            out_str_k = state_char + "".join(out_idx_k)
+            op_str_k = f"{out_char_k}{mo_char}"
+            einsum_1body_k = f"{op_str_k},{k_str}->{out_str_k}"
+            result = result + contract(einsum_1body_k, h_k_MO, K_s, backend="jax")
+
+        # 3. Σ_{k≠s} W_sk interaction (spatial for s, MO for k)
+        for k in range(N):
+            if k == s:
+                continue
+            # Get spatial g for pair (s, k)
+            if (s, k) in self.g_dict:
+                g_sk = self.g_dict[(s, k)]
+            elif (k, s) in self.g_dict:
+                g_sk = self._transpose_g(self.g_dict[(k, s)])
+            else:
+                continue
+
+            # W_sk: shape (N_spatial_s, N_spatial_s, M_k, M_k)
+            W_sk = self._partial_transform_g(g_sk, bs[k])
+
+            # Contract W_sk with K_s on axes (spatial_s, mo_k)
+            # W indices: (p, x_s, m, n_k) where p→new spatial, x_s→old spatial,
+            #            m→new MO_k, n_k→old MO_k
+            w_p = chr(98 + N)  # new spatial for s
+            w_q = chr(98 + N + 1)  # new MO for k
+            w_str = f"{w_p}{spatial_char}{w_q}{idx[k]}"
+            out_idx_w = list(idx)
+            out_idx_w[s] = w_p
+            out_idx_w[k] = w_q
+            out_str_w = state_char + "".join(out_idx_w)
+            einsum_2body = f"{w_str},{k_str}->{out_str_w}"
+            result = result + contract(einsum_2body, W_sk, K_s, backend="jax")
+
+        # 4. Σ_{k<l, k≠s, l≠s} g_kl_MO fully transformed (only for N≥3)
+        if N >= 3:
+            for k in range(N):
+                for l in range(k + 1, N):
+                    if k == s or l == s:
+                        continue
+                    # Get fully transformed g_kl_MO
+                    if (k, l) in self.g_dict:
+                        g_spatial = self.g_dict[(k, l)]
+                    elif (l, k) in self.g_dict:
+                        g_spatial = self._transpose_g(self.g_dict[(l, k)])
+                    else:
+                        continue
+
+                    _, g_kl_MO, _ = self.transform_g(g_spatial, bs[k], bs[l])
+
+                    # Contract g_kl_MO (shape M_k, M_l, M_k, M_l) with K_s
+                    # on axes k and l
+                    g_p = chr(98 + N)  # new MO for k
+                    g_q = chr(98 + N + 1)  # new MO for l
+                    g_str = f"{g_p}{g_q}{idx[k]}{idx[l]}"
+                    out_idx_g = list(idx)
+                    out_idx_g[k] = g_p
+                    out_idx_g[l] = g_q
+                    out_str_g = state_char + "".join(out_idx_g)
+                    einsum_g = f"{g_str},{k_str}->{out_str_g}"
+                    result = result + contract(einsum_g, g_kl_MO, K_s, backend="jax")
+
+        return factor * result
+
     @partial(jit, static_argnums=0)
     def _rhs_implicit(self, t, y):
         """Stiff (implicit) part of the RHS for IMEX splitting.
@@ -976,3 +1107,18 @@ class MCTDHF_n_species_DVR(MCTDHF_n_species):
     def _transpose_g(self, g):
         """Transpose 2D DVR integrals: (i, j) → (j, i)."""
         return jnp.transpose(g, (1, 0))
+
+    @partial(jit, static_argnums=0)
+    def _partial_transform_g(self, g, b_k):
+        """Partially transform DVR 2-body integrals on species k only.
+
+        For 2D DVR integrals: g has shape (N_spatial_s, N_spatial_k).
+        Returns W_sk with shape (N_spatial_s, N_spatial_s, M_k, M_k).
+
+        In DVR, i and k share the same spatial index for species s,
+        so W_sk[p, q, m, n] = δ_{pq} Σ_j b_k*[j, m] g[p, j] b_k[j, n].
+        """
+        # W_3d[i, m, n] = Σ_j b_k*[j, m] g[i, j] b_k[j, n]
+        W_3d = contract("jm, ij, jn -> imn", b_k.conj(), g, b_k, backend="jax")
+        # Expand to 4D with δ_{pq}: W_sk[p, q, m, n] = δ_{pq} W_3d[p, m, n]
+        return W_3d[:, None, :, :] * jnp.eye(g.shape[0])[:, :, None, None]
