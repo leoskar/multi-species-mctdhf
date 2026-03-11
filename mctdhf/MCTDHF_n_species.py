@@ -639,6 +639,7 @@ class MCTDHF_n_species:
         normalize=None,
         noise_C=0.0,
         noise_bs=0.0,
+        save_every=None,
     ):
         """Run the MCTDHF time propagation.
 
@@ -663,14 +664,22 @@ class MCTDHF_n_species:
             Magnitude of random perturbation added to each b in bs_init_list.
             Set to 0 for no perturbation. Applied to both default and
             user-provided bs_init_list.
+        save_every : int, optional
+            Save the state every this many steps. If None (default), only the
+            initial and final states are saved. Set to 1 to save every step.
+            If num_steps is not divisible by save_every, the final state is
+            always included.
 
         Returns
         -------
         ts : jnp.ndarray
-            Time points (num_steps + 1,).
+            Time points (num_saved + 1,).
         ys : jnp.ndarray
-            State vectors (num_steps + 1, dim_y).
+            State vectors (num_saved + 1, dim_y).
         """
+        if save_every is None:
+            save_every = num_steps
+
         # Validate shapes
         if bs_init_list is not None:
             if len(bs_init_list) != self.num_species:
@@ -745,13 +754,36 @@ class MCTDHF_n_species:
                 C = self.ortonorm_C(C)
                 bs_new = [self.ortonorm_b(b) for b in bs]
                 y = self._Cb_to_y(C, bs_new)
-            return (t, y), (t, y)
+            return (t, y), None
 
-        _, (ts_arr, ys_arr) = jax.lax.scan(step_fn, (t, y), None, length=num_steps)
+        def chunk_fn(carry, _):
+            """Run save_every steps, record the final state."""
+            carry, _ = jax.lax.scan(step_fn, carry, None, length=save_every)
+            t, y = carry
+            return carry, (t, y)
 
-        # Prepend initial values
-        ts = jnp.concatenate([jnp.array([t_init]), ts_arr])
-        ys = jnp.concatenate([y_init[None, :], ys_arr])
+        num_chunks = num_steps // save_every
+        remainder = num_steps % save_every
+
+        # Main scan: full chunks
+        if num_chunks > 0:
+            (t, y), (ts_arr, ys_arr) = jax.lax.scan(
+                chunk_fn, (t, y), None, length=num_chunks
+            )
+            ts_list = [jnp.array([t_init]), ts_arr]
+            ys_list = [y_init[None, :], ys_arr]
+        else:
+            ts_list = [jnp.array([t_init])]
+            ys_list = [y_init[None, :]]
+
+        # Handle remainder steps (always include the final state)
+        if remainder > 0:
+            (t, y), _ = jax.lax.scan(step_fn, (t, y), None, length=remainder)
+            ts_list.append(jnp.array([t]))
+            ys_list.append(y[None, :])
+
+        ts = jnp.concatenate(ts_list)
+        ys = jnp.concatenate(ys_list)
         return ts, ys
 
     # ── Observables ───────────────────────────────────────────────────────
