@@ -266,8 +266,8 @@ def get_cmf_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100):
     def integrate(t, y):
         C, bs = mctdh._y_to_Cb(y)
 
-        # 1. Transform integrals at current orbitals
-        h_current = mctdh._get_h_current(t)
+        # 1. Transform integrals at midpoint time for second-order accuracy
+        h_current = mctdh._get_h_current(t + dt / 2)
         h_MO_list = [
             mctdh.transform_h(h_current[s], bs[s])[1] for s in range(mctdh.num_species)
         ]
@@ -339,11 +339,12 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
         C, bs = mctdh._y_to_Cb(y)
 
         # ── Predictor: half-step with mean fields at t ──────────────────
-        h_current = mctdh._get_h_current(t)
+        h_current_t = mctdh._get_h_current(t)
+        h_current_mid = mctdh._get_h_current(t + dt_half)
 
         # Transform integrals at b(t)
         h_MO_list_t = [
-            mctdh.transform_h(h_current[s], bs[s])[1] for s in range(mctdh.num_species)
+            mctdh.transform_h(h_current_t[s], bs[s])[1] for s in range(mctdh.num_species)
         ]
         g_MO_dict_t, _ = mctdh._transform_all_g(bs, full=False)
 
@@ -363,11 +364,13 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
         D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
         P_frozens_t = [bs[s] @ bs[s].conj().T for s in range(mctdh.num_species)]
 
+        # Use h at t for the predictor half-step (anchored at t)
+
         # Orbital half-step: b(t) → b(t+dt/2)
         bs_half = _cn_solve_bs(
             mctdh,
             bs,
-            h_current,
+            h_current_t,
             D_invs_half,
             ds_half,
             bs,
@@ -380,8 +383,9 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
 
         # ── Corrector: full step with midpoint mean fields ──────────────
         # Re-transform integrals at b(t+dt/2)
+        # Use h at t+dt/2 for the corrector (midpoint-centered)
         h_MO_list_mid = [
-            mctdh.transform_h(h_current[s], bs_half[s])[1]
+            mctdh.transform_h(h_current_mid[s], bs_half[s])[1]
             for s in range(mctdh.num_species)
         ]
         g_MO_dict_mid, _ = mctdh._transform_all_g(bs_half, full=False)
@@ -408,7 +412,7 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
         bs_new = _cn_solve_bs(
             mctdh,
             bs,
-            h_current,
+            h_current_mid,
             D_invs_new,
             ds_new,
             bs_half,
