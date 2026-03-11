@@ -9,7 +9,7 @@ The CI part of the calculation is "semi-direct", storing single- and two-particl
 Install directly from GitHub:
 
 ```bash
-pip install git+https://github.com/leoskar/n-species-mctdh.git
+pip install "mctdhf-n-species @ git+ssh://git@github.com/leoskar/n-species-mctdh.git"
 ```
 
 With CUDA support:
