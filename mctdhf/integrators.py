@@ -213,6 +213,157 @@ def _cn_solve_bs(
     return bs_new
 
 
+def _sil_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10):
+    """Short Iterative Lanczos (SIL) propagation of CI coefficients.
+
+    Computes C(t+dt) = exp(dt*A)*C(t) where A is the CI Hamiltonian operator,
+    by building a Krylov subspace via the Lanczos algorithm and exponentiating
+    the resulting small tridiagonal matrix.
+
+    SIL is particularly efficient for the CI propagation because:
+    - The CI Hamiltonian is Hermitian, so Lanczos produces a real tridiagonal
+    - A small Krylov dimension (5-15) suffices for typical MCTDH time steps
+    - The matrix exponential is unitary (norm-preserving) for RTE
+
+    Uses full re-orthogonalization (V carried in scan state) for numerical
+    stability in float32/complex64 arithmetic.
+    """
+    c_flat = C.reshape(-1)
+    dim = c_flat.shape[0]
+    norm_c = jnp.linalg.norm(c_flat)
+    safe_norm = jnp.where(norm_c > 0, norm_c, 1.0)
+
+    # Lanczos on H (Hermitian): sigma = H*C = dCI.get_sigma(C, ...)
+    def apply_H(v_flat):
+        return mctdh.dCI.get_sigma(
+            v_flat.reshape(c_shape), h_MO_list, g_MO_dict
+        ).reshape(-1)
+
+    v0 = c_flat / safe_norm
+
+    # Lanczos iteration via lax.scan with full re-orthogonalization.
+    # V is carried in the scan state so that at each step we can
+    # orthogonalize against all previously computed basis vectors.
+    # This is essential for float32 where classical Lanczos loses
+    # orthogonality within a few iterations.
+    V_init = jnp.zeros((krylov_dim, dim), dtype=c_flat.dtype)
+
+    def lanczos_step(carry, j):
+        V, v_prev, v_curr, beta_prev = carry
+        # Store v_curr as basis vector j (at step start, not end,
+        # to avoid overwriting row 0 on the last iteration)
+        V = V.at[j].set(v_curr)
+        w = apply_H(v_curr)
+        alpha = jnp.real(jnp.dot(v_curr.conj(), w))
+        w = w - alpha * v_curr - beta_prev * v_prev
+        # Full re-orthogonalization against all stored basis vectors.
+        # Rows beyond j are zero so the dot products vanish — no
+        # masking needed, and the matmul is on a small (krylov_dim, dim)
+        # matrix which stays in GPU cache.
+        overlaps = jnp.dot(V.conj(), w)       # (krylov_dim,)
+        w = w - jnp.dot(overlaps, V)          # (dim,)
+        beta = jnp.sqrt(jnp.real(jnp.dot(w.conj(), w)))
+        safe_beta = jnp.where(beta > 1e-15, beta, 1.0)
+        v_next = w / safe_beta
+        return (V, v_curr, v_next, beta), (alpha, beta)
+
+    init = (V_init, jnp.zeros_like(v0), v0, jnp.array(0.0, dtype=c_flat.real.dtype))
+    (V_final, _, _, _), (alphas, betas) = jax.lax.scan(
+        lanczos_step, init, jnp.arange(krylov_dim), length=krylov_dim
+    )
+    # alphas: (krylov_dim,), betas: (krylov_dim,)
+    # V_final[0:krylov_dim] contains the orthonormal basis vectors
+
+    # Build real symmetric tridiagonal T
+    T = jnp.diag(alphas) + jnp.diag(betas[:-1], 1) + jnp.diag(betas[:-1], -1)
+
+    # Time propagation: exp(-i*dt*H) for RTE, exp(-dt*H) for ITE
+    if mctdh.imag_time:
+        expT = jax.scipy.linalg.expm(-dt * T)
+    else:
+        expT = jax.scipy.linalg.expm(-1j * dt * T)
+
+    e1 = jnp.zeros(krylov_dim, dtype=expT.dtype).at[0].set(1.0)
+    coeffs = expT @ e1
+
+    # Reconstruct: C_new = ||C|| * V^T @ coeffs (V is orthonormal)
+    c_new_flat = safe_norm * jnp.dot(coeffs, V_final)
+    c_new_flat = jnp.where(norm_c > 0, c_new_flat, c_flat)
+
+    return c_new_flat.reshape(c_shape)
+
+
+def _bs_modified_midpoint(rhs_fn, y0, dt, n_steps):
+    """Modified midpoint method with n_steps subdivisions and smoothing.
+
+    Computes an O(h^2) approximation to y(t+dt) where h = dt/n_steps.
+    Used as the base method for Bulirsch-Stoer extrapolation.
+    """
+    h = dt / n_steps
+
+    z_prev = y0
+    z_curr = y0 + h * rhs_fn(y0)
+
+    def body(_, carry):
+        z_prev, z_curr = carry
+        z_next = z_prev + 2 * h * rhs_fn(z_curr)
+        return (z_curr, z_next)
+
+    z_prev, z_curr = jax.lax.fori_loop(1, n_steps, body, (z_prev, z_curr))
+
+    # Smoothing step
+    return 0.5 * (z_curr + z_prev + h * rhs_fn(z_curr))
+
+
+def _bs_solve_bs(
+    mctdh,
+    bs_start,
+    h_current,
+    D_invs,
+    ds,
+    bs_frozen,
+    P_frozens,
+    dt,
+    b_shapes,
+    bs_sequence=(2, 4, 6, 8, 12, 16),
+):
+    """Bulirsch-Stoer solve for all orbital sub-problems.
+
+    Uses the modified midpoint method with Richardson extrapolation
+    (polynomial, Neville's algorithm) to achieve high-order accuracy.
+    The Bulirsch-Stoer method is well-suited for the orbital propagation
+    because it achieves high accuracy with relatively few RHS evaluations
+    compared to fixed-order methods.
+    """
+    bs_new = list(bs_start)
+    for s in range(mctdh.num_species):
+        b_s = bs_start[s]
+
+        def rhs_b(b, _s=s):
+            return mctdh._rhs_b_linear(
+                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, P_frozens[_s]
+            )
+
+        # Compute modified midpoint approximations for each n in sequence
+        T_list = []
+        h_sq = []
+        for n in bs_sequence:
+            T_n = _bs_modified_midpoint(rhs_b, b_s, dt, n)
+            T_list.append(T_n)
+            h_sq.append((dt / n) ** 2)
+
+        # Polynomial extrapolation (Neville's algorithm)
+        # T_list[i] has error O(h_i^2), extrapolation removes successive
+        # powers of h^2 to reach O(h^{2*len(sequence)})
+        for k in range(1, len(bs_sequence)):
+            for i in range(len(bs_sequence) - 1, k - 1, -1):
+                ratio = h_sq[i - k] / h_sq[i]
+                T_list[i] = T_list[i] + (T_list[i] - T_list[i - 1]) / (ratio - 1)
+
+        bs_new[s] = T_list[-1]
+    return bs_new
+
+
 def _compute_density_quantities(mctdh, C):
     """Compute state-averaged RDMs and regularized inverse density matrices.
 
@@ -302,7 +453,17 @@ def get_cmf_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100):
     return integrate
 
 
-def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100):
+def get_cmf_half_step_integrator(
+    mctdh,
+    dt,
+    solver_tol=1e-8,
+    max_solver_iter=100,
+    n_orbital_substeps=1,
+    c_propagator="cn",
+    b_propagator="cn",
+    sil_krylov_dim=10,
+    bs_sequence=(2, 4, 6, 8, 12, 16),
+):
     """Improved CMF integrator with half-step predictor-corrector.
 
     Uses a midpoint scheme to reduce the CMF splitting error from O(dt²)
@@ -321,18 +482,38 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
     Args:
         mctdh: MCTDHF_n_species instance.
         dt: Time step.
-        solver_tol: Convergence tolerance for BiCGSTAB.
-        max_solver_iter: Maximum BiCGSTAB iterations.
+        solver_tol: Convergence tolerance for BiCGSTAB (CN only).
+        max_solver_iter: Maximum BiCGSTAB iterations (CN only).
+        n_orbital_substeps: Number of sub-steps for the orbital CN solves.
+            The mean fields (density matrices, projectors, MO integrals)
+            remain frozen; only the orbital time integration is refined.
+            Useful when the orbital EOM is stiffer than the CI EOM (e.g.
+            large spatial grids). Default 1 (no sub-stepping). Only used
+            when b_propagator='cn'.
+        c_propagator: Sub-integrator for CI coefficients. Options:
+            'cn' - Crank-Nicolson with BiCGSTAB (default)
+            'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp)
+        b_propagator: Sub-integrator for orbitals. Options:
+            'cn' - Crank-Nicolson with BiCGSTAB (default)
+            'bs' - Bulirsch-Stoer (modified midpoint + Richardson extrapolation)
+        sil_krylov_dim: Krylov subspace dimension for SIL (default 10).
+        bs_sequence: Subdivision sequence for Bulirsch-Stoer extrapolation.
+            Default (2, 4, 6, 8, 12, 16).
 
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
+    if c_propagator not in ("cn", "sil"):
+        raise ValueError(f"Unknown c_propagator '{c_propagator}'. Use 'cn' or 'sil'.")
+    if b_propagator not in ("cn", "bs"):
+        raise ValueError(f"Unknown b_propagator '{b_propagator}'. Use 'cn' or 'bs'.")
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
     b_shapes = [
         (mctdh.num_spatial_orbitals[s], mctdh.num_mctdhf_orbitals[s])
         for s in range(mctdh.num_species)
     ]
     dt_half = dt / 2
+    n_sub = n_orbital_substeps
 
     @jax.jit
     def integrate(t, y):
@@ -350,37 +531,57 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
         g_MO_dict_t, _ = mctdh._transform_all_g(bs, full=False)
 
         # CI half-step: C(t) → C(t+dt/2)
-        C_half = _cn_solve_C(
-            mctdh,
-            C,
-            h_MO_list_t,
-            g_MO_dict_t,
-            dt_half,
-            c_shape,
-            solver_tol,
-            max_solver_iter,
-        )
+        if c_propagator == "sil":
+            C_half = _sil_solve_C(
+                mctdh, C, h_MO_list_t, g_MO_dict_t, dt_half, c_shape, sil_krylov_dim
+            )
+        else:
+            C_half = _cn_solve_C(
+                mctdh,
+                C,
+                h_MO_list_t,
+                g_MO_dict_t,
+                dt_half,
+                c_shape,
+                solver_tol,
+                max_solver_iter,
+            )
 
         # Density matrices from C(t+dt/2)
         D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
         P_frozens_t = [bs[s] @ bs[s].conj().T for s in range(mctdh.num_species)]
 
-        # Use h at t for the predictor half-step (anchored at t)
-
         # Orbital half-step: b(t) → b(t+dt/2)
-        bs_half = _cn_solve_bs(
-            mctdh,
-            bs,
-            h_current_t,
-            D_invs_half,
-            ds_half,
-            bs,
-            P_frozens_t,
-            dt_half,
-            b_shapes,
-            solver_tol,
-            max_solver_iter,
-        )
+        if b_propagator == "bs":
+            bs_half = _bs_solve_bs(
+                mctdh,
+                bs,
+                h_current_t,
+                D_invs_half,
+                ds_half,
+                bs,
+                P_frozens_t,
+                dt_half,
+                b_shapes,
+                bs_sequence,
+            )
+        else:
+            dt_orb_pred = dt_half / n_sub
+            bs_half = bs
+            for _ in range(n_sub):
+                bs_half = _cn_solve_bs(
+                    mctdh,
+                    bs_half,
+                    h_current_t,
+                    D_invs_half,
+                    ds_half,
+                    bs,
+                    P_frozens_t,
+                    dt_orb_pred,
+                    b_shapes,
+                    solver_tol,
+                    max_solver_iter,
+                )
 
         # ── Corrector: full step with midpoint mean fields ──────────────
         # Re-transform integrals at b(t+dt/2)
@@ -392,16 +593,21 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
         g_MO_dict_mid, _ = mctdh._transform_all_g(bs_half, full=False)
 
         # CI full step: C(t) → C(t+dt) using midpoint MO integrals
-        C_new = _cn_solve_C(
-            mctdh,
-            C,
-            h_MO_list_mid,
-            g_MO_dict_mid,
-            dt,
-            c_shape,
-            solver_tol,
-            max_solver_iter,
-        )
+        if c_propagator == "sil":
+            C_new = _sil_solve_C(
+                mctdh, C, h_MO_list_mid, g_MO_dict_mid, dt, c_shape, sil_krylov_dim
+            )
+        else:
+            C_new = _cn_solve_C(
+                mctdh,
+                C,
+                h_MO_list_mid,
+                g_MO_dict_mid,
+                dt,
+                c_shape,
+                solver_tol,
+                max_solver_iter,
+            )
 
         # Density matrices from C(t+dt)
         D_invs_new, ds_new = _compute_density_quantities(mctdh, C_new)
@@ -409,20 +615,37 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
             bs_half[s] @ bs_half[s].conj().T for s in range(mctdh.num_species)
         ]
 
-        # Orbital full step: b(t) → b(t+dt) using midpoint P and tau
-        bs_new = _cn_solve_bs(
-            mctdh,
-            bs,
-            h_current_mid,
-            D_invs_new,
-            ds_new,
-            bs_half,
-            P_frozens_mid,
-            dt,
-            b_shapes,
-            solver_tol,
-            max_solver_iter,
-        )
+        # Orbital full step: b(t) → b(t+dt) using midpoint mean fields
+        if b_propagator == "bs":
+            bs_new = _bs_solve_bs(
+                mctdh,
+                bs,
+                h_current_mid,
+                D_invs_new,
+                ds_new,
+                bs_half,
+                P_frozens_mid,
+                dt,
+                b_shapes,
+                bs_sequence,
+            )
+        else:
+            dt_orb_corr = dt / n_sub
+            bs_new = bs
+            for _ in range(n_sub):
+                bs_new = _cn_solve_bs(
+                    mctdh,
+                    bs_new,
+                    h_current_mid,
+                    D_invs_new,
+                    ds_new,
+                    bs_half,
+                    P_frozens_mid,
+                    dt_orb_corr,
+                    b_shapes,
+                    solver_tol,
+                    max_solver_iter,
+                )
 
         return t + dt, mctdh._Cb_to_y(C_new, bs_new)
 
