@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mctdhf-n-species"
-version = "0.6.3"
+version = "0.6.4"
 description = "N-species MCTDHF calculations using JAX with semi-direct CI."
 readme = "README.md"
 requires-python = ">=3.10"

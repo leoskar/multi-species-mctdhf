@@ -1154,12 +1154,75 @@ class MCTDHF_n_species_DVR(MCTDHF_n_species):
         """Partially transform DVR 2-body integrals on species k only.
 
         For 2D DVR integrals: g has shape (N_spatial_s, N_spatial_k).
-        Returns W_sk with shape (N_spatial_s, N_spatial_s, M_k, M_k).
+        Returns W_3d with shape (N_spatial_s, M_k, M_k) — the compact
+        DVR representation where the δ_{pq} is implicit.
 
-        In DVR, i and k share the same spatial index for species s,
-        so W_sk[p, q, m, n] = δ_{pq} Σ_j b_k*[j, m] g[p, j] b_k[j, n].
+        W_3d[i, m, n] = Σ_j b_k*[j, m] g[i, j] b_k[j, n]
         """
-        # W_3d[i, m, n] = Σ_j b_k*[j, m] g[i, j] b_k[j, n]
-        W_3d = contract("jm, ij, jn -> imn", b_k.conj(), g, b_k, backend="jax")
-        # Expand to 4D with δ_{pq}: W_sk[p, q, m, n] = δ_{pq} W_3d[p, m, n]
-        return W_3d[:, None, :, :] * jnp.eye(g.shape[0])[:, :, None, None]
+        return contract("jm, ij, jn -> imn", b_k.conj(), g, b_k, backend="jax")
+
+    def _apply_K_hamiltonian(self, K_s, s, h_s, h_MO_others, W_list, g_MO_list):
+        """DVR-specialized K Hamiltonian: uses 3D W_sk instead of 4D.
+
+        In DVR, W_sk has shape (N_spatial_s, M_k, M_k) with implicit
+        δ_{pq}, so the contraction only sums over the MO index of
+        species k while the spatial index of species s is shared
+        (not summed over).
+        """
+        N = self.num_species
+        factor = -1.0 if self.imag_time else -1j
+
+        idx = [chr(98 + k) for k in range(N)]
+        state_char = "a"
+        spatial_char = idx[s]
+        k_str = state_char + "".join(idx)
+
+        # 1. h_s @ K_s — 1-body spatial operator on species s axis
+        out_char = chr(98 + N)
+        out_idx = list(idx)
+        out_idx[s] = out_char
+        out_str = state_char + "".join(out_idx)
+        op_str = f"{out_char}{spatial_char}"
+        result = contract(f"{op_str},{k_str}->{out_str}", h_s, K_s, backend="jax")
+
+        # 2. Σ_{k≠s} K_s ×_k h_k_MO — same as base class
+        for k, h_k_MO in h_MO_others:
+            out_char_k = chr(98 + N)
+            out_idx_k = list(idx)
+            out_idx_k[k] = out_char_k
+            out_str_k = state_char + "".join(out_idx_k)
+            op_str_k = f"{out_char_k}{idx[k]}"
+            result = result + contract(
+                f"{op_str_k},{k_str}->{out_str_k}", h_k_MO, K_s, backend="jax"
+            )
+
+        # 3. Σ_{k≠s} W_sk interaction — DVR-optimized 3D contraction
+        # W_3d has shape (N_spatial_s, M_k, M_k), indices: (spatial_s, new_mo_k, old_mo_k)
+        # The spatial_s index in W_3d matches the spatial axis of K_s (no sum),
+        # and we only contract over old_mo_k.
+        for k, W_3d in W_list:
+            w_q = chr(98 + N)  # new MO for k
+            # W_3d indices: (spatial_s, new_mo_k, old_mo_k)
+            w_str = f"{spatial_char}{w_q}{idx[k]}"
+            out_idx_w = list(idx)
+            out_idx_w[k] = w_q
+            out_str_w = state_char + "".join(out_idx_w)
+            result = result + contract(
+                f"{w_str},{k_str}->{out_str_w}", W_3d, K_s, backend="jax"
+            )
+
+        # 4. Σ_{k<l, k≠s, l≠s} g_kl_MO (N ≥ 3 only) — same as base class
+        for k, l, g_kl_MO in g_MO_list:
+            g_p = chr(98 + N)
+            g_q = chr(98 + N + 1)
+            g_str = f"{g_p}{g_q}{idx[k]}{idx[l]}"
+            out_idx_g = list(idx)
+            out_idx_g[k] = g_p
+            out_idx_g[l] = g_q
+            out_str_g = state_char + "".join(out_idx_g)
+            result = result + contract(
+                f"{g_str},{k_str}->{out_str_g}", g_kl_MO, K_s, backend="jax"
+            )
+
+        return factor * result
+

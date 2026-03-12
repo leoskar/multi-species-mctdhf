@@ -344,7 +344,8 @@ def get_cmf_half_step_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100
 
         # Transform integrals at b(t)
         h_MO_list_t = [
-            mctdh.transform_h(h_current_t[s], bs[s])[1] for s in range(mctdh.num_species)
+            mctdh.transform_h(h_current_t[s], bs[s])[1]
+            for s in range(mctdh.num_species)
         ]
         g_MO_dict_t, _ = mctdh._transform_all_g(bs, full=False)
 
