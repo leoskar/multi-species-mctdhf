@@ -606,7 +606,7 @@ class MCTDHF_n_species:
 
         return self._Cb_to_y(C_dot, b_dots)
 
-    # ── Orthonormalization ────────────────────────────────────────────────
+    # ── Normalization/Orthonormalization ──────────────────────────────────
 
     @partial(jit, static_argnums=0)
     def ortonorm_b(self, b):
@@ -627,6 +627,22 @@ class MCTDHF_n_species:
         signs = jnp.where(signs == 0, 1.0, signs)
         return ((Q * signs[None, :]).T).reshape(original_shape)
 
+    @partial(jit, static_argnums=0)
+    def normalize_b(self, b):
+        """Normalize orbital columns without orthogonalizing."""
+        norms = jnp.linalg.norm(b, axis=0)
+        norms = jnp.where(norms == 0, 1.0, norms)
+        return b / norms[None, :]
+
+    @partial(jit, static_argnums=0)
+    def normalize_C(self, C):
+        """Normalize states in C without orthogonalizing."""
+        original_shape = C.shape
+        C_flat = C.reshape(C.shape[0], -1)
+        norms = jnp.linalg.norm(C_flat, axis=1)
+        norms = jnp.where(norms == 0, 1.0, norms)
+        return (C_flat / norms[:, None]).reshape(original_shape)
+
     # ── Integration ───────────────────────────────────────────────────────
 
     def integrate(
@@ -639,7 +655,7 @@ class MCTDHF_n_species:
         normalize=None,
         noise_C=0.0,
         noise_bs=0.0,
-        save_every=None,
+        save_every=1,
     ):
         """Run the MCTDHF time propagation.
 
@@ -655,8 +671,10 @@ class MCTDHF_n_species:
             Initial orbitals. If None, uses lowest eigenstates of h.
         C_init : jnp.ndarray, optional
             Initial CI coefficients. If None, uses energy-ordered product states.
-        normalize : bool, optional
-            Force normalization each step. Defaults to True for imaginary time.
+        normalize : bool or str, optional
+            How to normalize each step. Can be 'orthonormalize', 'normalize',
+            True (maps to 'orthonormalize'), False, or None. Defaults to
+            'orthonormalize' for imaginary time, False otherwise.
         noise_C : float
             Magnitude of random perturbation added to C_init. Set to 0 for
             no perturbation. Applied to both default and user-provided C_init.
@@ -665,8 +683,7 @@ class MCTDHF_n_species:
             Set to 0 for no perturbation. Applied to both default and
             user-provided bs_init_list.
         save_every : int, optional
-            Save the state every this many steps. If None (default), only the
-            initial and final states are saved. Set to 1 to save every step.
+            Save the state every this many steps. Set to 1 to save every step (default).
             If num_steps is not divisible by save_every, the final state is
             always included.
 
@@ -677,8 +694,6 @@ class MCTDHF_n_species:
         ys : jnp.ndarray
             State vectors (num_saved + 1, dim_y).
         """
-        if save_every is None:
-            save_every = num_steps
 
         # Validate shapes
         if bs_init_list is not None:
@@ -744,18 +759,37 @@ class MCTDHF_n_species:
         y_init = self._Cb_to_y(C_init, bs_init_list)
         t = t_init
         y = y_init
-        do_normalize = normalize or self.imag_time
 
+        # Handle normalization option
+        if normalize is True or (normalize is None and self.imag_time):
+            norm_mode = "orthonormalize"
+        elif normalize is False or normalize is None:
+            norm_mode = "none"
+        else:
+            norm_mode = normalize
+
+        if norm_mode not in ("orthonormalize", "normalize", "none"):
+            raise ValueError(f"Unknown normalize option: {normalize}")
+
+        @jit
         def step_fn(carry, _):
             t, y = carry
             t, y = integrator(t, y)
-            if do_normalize:
+
+            if norm_mode == "orthonormalize":
                 C, bs = self._y_to_Cb(y)
                 C = self.ortonorm_C(C)
                 bs_new = [self.ortonorm_b(b) for b in bs]
                 y = self._Cb_to_y(C, bs_new)
+            elif norm_mode == "normalize":
+                C, bs = self._y_to_Cb(y)
+                C = self.normalize_C(C)
+                bs_new = [self.normalize_b(b) for b in bs]
+                y = self._Cb_to_y(C, bs_new)
+
             return (t, y), None
 
+        @jit
         def chunk_fn(carry, _):
             """Run save_every steps, record the final state."""
             carry, _ = jax.lax.scan(step_fn, carry, None, length=save_every)
@@ -1225,4 +1259,3 @@ class MCTDHF_n_species_DVR(MCTDHF_n_species):
             )
 
         return factor * result
-
