@@ -17,7 +17,10 @@ import numpy as np
 import itertools
 
 from .SemiDirectCI_n_species import SemiDirectCI_n_species
-from .integrators import get_crank_nicolson_fixed_iter
+from .integrators import (
+    get_crank_nicolson_fixed_iter,
+    get_adaptive_cmf_half_step_integrator,
+)
 
 
 class MCTDHF_n_species:
@@ -820,6 +823,251 @@ class MCTDHF_n_species:
         ys = jnp.concatenate(ys_list)
         return ts, ys
 
+    def integrate_adaptive(
+        self,
+        t_init,
+        t_final,
+        dt_init,
+        C_init=None,
+        bs_init_list=None,
+        num_save=100,
+        tol=1e-5,
+        dt_min=1e-8,
+        dt_max=None,
+        safety=0.8,
+        sil_krylov_dim=10,
+        sil_b_krylov_dim=20,
+        normalize=None,
+        noise_C=0.0,
+        noise_bs=0.0,
+    ):
+        """Adaptive-step CMF half-step integration with SIL sub-propagators.
+
+        Automatically adjusts the time step to keep local error below tolerance,
+        using SIL Krylov errors and CMF splitting error estimates. Uses a PI
+        controller for smooth step size adaptation.
+
+        Parameters
+        ----------
+        t_init : float
+            Initial time.
+        t_final : float
+            Final time.
+        dt_init : float
+            Initial time step guess.
+        C_init : jnp.ndarray, optional
+            Initial CI coefficients. If None, uses energy-ordered product states.
+        bs_init_list : list of jnp.ndarray, optional
+            Initial orbitals. If None, uses lowest eigenstates of h.
+        num_save : int
+            Number of save points (output has num_save + 1 entries including t_init).
+        tol : float
+            Error tolerance for step acceptance. The error estimate is the
+            relative CMF splitting error (normalized by ||C||), so this
+            controls the per-step relative accuracy of the CI propagation.
+            Note: with complex64 state arrays, the error estimator has a
+            noise floor of ~1e-7. Set tol well above this (default 1e-5).
+        dt_min : float
+            Minimum allowed time step.
+        dt_max : float, optional
+            Maximum allowed time step. Defaults to 10 * dt_init.
+        safety : float
+            Safety factor for PI controller (default 0.8).
+        sil_krylov_dim : int
+            Krylov subspace dimension for CI SIL.
+        sil_b_krylov_dim : int
+            Krylov subspace dimension for orbital SIL.
+        normalize : bool or str, optional
+            Normalization mode. Same as integrate().
+        noise_C : float
+            Perturbation magnitude for C_init.
+        noise_bs : float
+            Perturbation magnitude for bs_init_list.
+
+        Returns
+        -------
+        ts : jnp.ndarray
+            Save times (num_save + 1,).
+        ys : jnp.ndarray
+            State vectors (num_save + 1, dim_y).
+        info : dict
+            Dictionary with 'steps_taken' and 'steps_rejected' counts.
+        """
+        if dt_max is None:
+            dt_max = 10 * dt_init
+
+        # ── Initialize state (same logic as integrate) ──────────────────
+        evals_list = []
+        if bs_init_list is None:
+            bs_init_list = []
+            for s, h in enumerate(self._get_h_current(t_init)):
+                eigvals, eigvecs = np.linalg.eigh(np.array(h))
+                evals_list.append(eigvals)
+                b_init = eigvecs[:, : self.num_mctdhf_orbitals[s]]
+                bs_init_list.append(jnp.array(b_init, dtype=jnp.complex64))
+                print(
+                    f"Species {s}: lowest eigenvalues = {eigvals[:self.num_mctdhf_orbitals[s]]}"
+                )
+        else:
+            for s, h in enumerate(self._get_h_current(t_init)):
+                eigvals, _ = np.linalg.eigh(np.array(h))
+                evals_list.append(eigvals)
+
+        if C_init is None:
+            ranges = [range(n) for n in self.num_mctdhf_orbitals]
+            product_states = []
+            for indices in itertools.product(*ranges):
+                E_nonint = sum(evals_list[s][n] for s, n in enumerate(indices))
+                product_states.append((E_nonint, indices))
+            product_states.sort(key=lambda x: x[0])
+
+            C_init = np.zeros((self.num_states,) + tuple(self.num_mctdhf_orbitals))
+            for state_idx in range(min(self.num_states, len(product_states))):
+                _, indices = product_states[state_idx]
+                C_init[(state_idx,) + indices] = 1.0
+            C_init = jnp.array(C_init, dtype=jnp.complex64)
+
+        rng = np.random.default_rng(42)
+        if noise_C > 0:
+            C_init = C_init + noise_C * jnp.array(
+                rng.standard_normal(C_init.shape), dtype=jnp.complex64
+            )
+            C_init = self.ortonorm_C(C_init)
+        if noise_bs > 0:
+            bs_init_list = [
+                self.ortonorm_b(
+                    b
+                    + noise_bs
+                    * jnp.array(rng.standard_normal(b.shape), dtype=jnp.complex64)
+                )
+                for b in bs_init_list
+            ]
+
+        y_init = self._Cb_to_y(C_init, bs_init_list)
+
+        # Normalization mode
+        if normalize is True or (normalize is None and self.imag_time):
+            norm_mode = "orthonormalize"
+        elif normalize is False or normalize is None:
+            norm_mode = "none"
+        else:
+            norm_mode = normalize
+
+        if norm_mode not in ("orthonormalize", "normalize", "none"):
+            raise ValueError(f"Unknown normalize option: {normalize}")
+
+        # ── Build adaptive step function ────────────────────────────────
+        adaptive_step = get_adaptive_cmf_half_step_integrator(
+            self,
+            sil_krylov_dim=sil_krylov_dim,
+            sil_b_krylov_dim=sil_b_krylov_dim,
+        )
+
+        # PI controller parameters
+        p = 3  # CMF half-step order
+        alpha = 0.7 / p
+        beta_pi = 0.4 / p
+
+        save_times = jnp.linspace(t_init, t_final, num_save + 1)
+
+        def normalize_y(y):
+            if norm_mode == "orthonormalize":
+                C, bs = self._y_to_Cb(y)
+                C = self.ortonorm_C(C)
+                bs_n = [self.ortonorm_b(b) for b in bs]
+                return self._Cb_to_y(C, bs_n)
+            elif norm_mode == "normalize":
+                C, bs = self._y_to_Cb(y)
+                C = self.normalize_C(C)
+                bs_n = [self.normalize_b(b) for b in bs]
+                return self._Cb_to_y(C, bs_n)
+            else:
+                return y
+
+        @jax.jit
+        def integrate_interval(carry, t_target):
+            t, y, dt, error_prev, n_steps, n_rejected = carry
+
+            def cond(state):
+                t, _, _, _, _, _ = state
+                return t < t_target - 1e-14
+
+            def body(state):
+                t, y, dt, error_prev, n_steps, n_rejected = state
+
+                # Clip dt to not overshoot target
+                dt_use = jnp.minimum(dt, t_target - t)
+                dt_use = jnp.maximum(dt_use, dt_min)
+
+                t_trial, y_trial, err_sil, err_split = adaptive_step(t, y, dt_use)
+                t_trial = t_trial.astype(float_dtype)
+                y_trial = y_trial.astype(y.dtype)
+                error = jnp.maximum(err_sil, err_split).astype(float_dtype)
+
+                accepted = error < tol
+
+                # PI controller for next step size
+                safe_error = jnp.maximum(error, 1e-30)
+                safe_error_prev = jnp.maximum(error_prev, 1e-30)
+                dt_factor = (
+                    safety
+                    * (tol / safe_error) ** alpha
+                    * (safe_error_prev / tol) ** beta_pi
+                )
+                dt_factor = jnp.clip(dt_factor, 0.2, 2.0)
+                dt_new = jnp.clip(dt_use * dt_factor, dt_min, dt_max)
+
+                t_out = jnp.where(accepted, t_trial, t).astype(float_dtype)
+                y_out = jnp.where(accepted, y_trial, y)
+                err_out = jnp.where(accepted, safe_error, error_prev).astype(
+                    float_dtype
+                )
+                dt_new = dt_new.astype(float_dtype)
+                n_steps_out = n_steps + jnp.int32(1)
+                n_rejected_out = n_rejected + jnp.where(
+                    accepted, jnp.int32(0), jnp.int32(1)
+                )
+
+                return (t_out, y_out, dt_new, err_out, n_steps_out, n_rejected_out)
+
+            result = jax.lax.while_loop(
+                cond, body, (t, y, dt, error_prev, n_steps, n_rejected)
+            )
+            t_out, y_out, dt_out, err_out, n_steps_out, n_rejected_out = result
+
+            # Apply normalization at save points
+            y_out = normalize_y(y_out)
+
+            carry_out = (t_out, y_out, dt_out, err_out, n_steps_out, n_rejected_out)
+            return carry_out, (t_out, y_out)
+
+        # ── Run integration ─────────────────────────────────────────────
+        float_dtype = save_times.dtype
+        init_carry = (
+            jnp.array(t_init, dtype=float_dtype),
+            y_init,
+            jnp.array(dt_init, dtype=float_dtype),
+            jnp.array(tol, dtype=float_dtype),  # initial error_prev = tol
+            jnp.int32(0),  # steps taken
+            jnp.int32(0),  # steps rejected
+        )
+
+        final_carry, (ts_saved, ys_saved) = jax.lax.scan(
+            integrate_interval, init_carry, save_times[1:]
+        )
+
+        # Prepend initial state
+        ts_out = jnp.concatenate([jnp.array([t_init]), ts_saved])
+        ys_out = jnp.concatenate([y_init[None, :], ys_saved])
+
+        _, _, _, _, n_steps_total, n_rejected_total = final_carry
+        info = {
+            "steps_taken": int(n_steps_total),
+            "steps_rejected": int(n_rejected_total),
+        }
+
+        return ts_out, ys_out, info
+
     # ── Observables ───────────────────────────────────────────────────────
 
     @partial(jit, static_argnums=0)
@@ -912,7 +1160,7 @@ class MCTDHF_n_species:
         c1 = [chr(97 + i) for i in range(K)]  # a, b, c, ...
         c2 = [chr(97 + K + i) for i in range(K)]  # d, e, f, ...
         s_pairs = ",".join(f"{c1[i]}{c2[i]}" for i in range(K))
-        einsum_str = f"s{''.join(c1)},s{''.join(c2)},{s_pairs}->s"
+        einsum_str = f"s{''.join(c1)},t{''.join(c2)},{s_pairs}->st"
 
         return contract(einsum_str, C1.conj(), C2, *S_matrices, backend="jax")
 
