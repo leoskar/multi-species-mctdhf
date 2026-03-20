@@ -1398,7 +1398,7 @@ class MCTDHF_n_species_DVR(MCTDHF_n_species):
     """MCTDHF variant for DVR (Discrete Variable Representation) basis.
 
     In DVR, the 2-body integrals g are diagonal in spatial coordinates:
-    g_{ij} = V(x_i, x_j) · dx_i · dx_j (2D array instead of 4D).
+    g_{ij} = V(x_i, x_j) (2D array instead of 4D).
     """
 
     @partial(jit, static_argnums=0)

@@ -238,7 +238,7 @@ class SineDVR:
         """Get the 2-body interaction matrix elements (same species).
         
         For DVR, the 2-body integrals are diagonal in the combined spatial
-        index, giving a 2D matrix g_{ij} = V(x_i, x_j) * dx^2.
+        index, giving a 2D matrix g_{ij} = V(x_i, x_j).
         
         Parameters
         ----------
@@ -256,11 +256,11 @@ class SineDVR:
         
         # Evaluate interaction (try both signatures)
         try:
-            g = interaction(x1, x2) * self.dx ** 2
+            g = interaction(x1, x2)
         except TypeError:
             # If interaction takes |r|, compute distance
             r = np.abs(x1 - x2)
-            g = interaction(r) * self.dx ** 2
+            g = interaction(r)
         
         return g
     
@@ -285,14 +285,11 @@ class SineDVR:
         # Create meshgrid between the two grids
         x1, x2 = np.meshgrid(self.grid, other_dvr.grid, indexing='ij')
         
-        # Evaluate interaction with combined dx factors
-        dx_combined = self.dx * other_dvr.dx
-        
         try:
-            g = interaction(x1, x2) * dx_combined
+            g = interaction(x1, x2)
         except TypeError:
             r = np.abs(x1 - x2)
-            g = interaction(r) * dx_combined
+            g = interaction(r)
         
         return g
     
