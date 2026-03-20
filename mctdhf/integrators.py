@@ -553,12 +553,21 @@ def _compute_density_quantities(mctdh, C):
     return D_invs, ds
 
 
-def get_cmf_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100):
-    """Constant Mean Field (CMF) integrator using CN + BiCGSTAB.
+def get_cmf_integrator(
+    mctdh,
+    dt,
+    solver_tol=1e-8,
+    max_solver_iter=100,
+    c_propagator="cn",
+    b_propagator="cn",
+    sil_krylov_dim=10,
+    sil_b_krylov_dim=20,
+):
+    """Constant Mean Field (CMF) integrator.
 
     Decouples the CI and orbital propagation, making each sub-problem
-    linear. Uses Crank-Nicolson time discretization with BiCGSTAB
-    iterative solver for the implicit linear systems.
+    linear. The sub-problems can be solved with Crank-Nicolson (CN) or
+    Short Iterative Lanczos (SIL).
 
     This allows dt 100-1000× larger than Picard-iteration CN because
     the decoupled sub-problems are genuinely linear and can be solved
@@ -570,12 +579,25 @@ def get_cmf_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100):
     Args:
         mctdh: MCTDHF_n_species instance.
         dt: Time step.
-        solver_tol: Convergence tolerance for BiCGSTAB.
-        max_solver_iter: Maximum BiCGSTAB iterations.
+        solver_tol: Convergence tolerance for BiCGSTAB (CN only).
+        max_solver_iter: Maximum BiCGSTAB iterations (CN only).
+        c_propagator: Sub-integrator for CI coefficients. Options:
+            'cn' - Crank-Nicolson with BiCGSTAB (default)
+            'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp)
+        b_propagator: Sub-integrator for orbitals. Options:
+            'cn' - Crank-Nicolson with BiCGSTAB (default)
+            'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp).
+                Recommended for large DVR grids where dt * max(h) >> 1.
+        sil_krylov_dim: Krylov subspace dimension for CI SIL (default 10).
+        sil_b_krylov_dim: Krylov subspace dimension for orbital SIL (default 20).
 
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
+    if c_propagator not in ("cn", "sil"):
+        raise ValueError(f"Unknown c_propagator '{c_propagator}'. Use 'cn' or 'sil'.")
+    if b_propagator not in ("cn", "sil"):
+        raise ValueError(f"Unknown b_propagator '{b_propagator}'. Use 'cn' or 'sil'.")
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
     b_shapes = [
         (mctdh.num_spatial_orbitals[s], mctdh.num_mctdhf_orbitals[s])
@@ -593,29 +615,48 @@ def get_cmf_integrator(mctdh, dt, solver_tol=1e-8, max_solver_iter=100):
         ]
         g_MO_dict, _ = mctdh._transform_all_g(bs, full=False)
 
-        # 2. CN-solve CI (orbitals frozen)
-        C_new = _cn_solve_C(
-            mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, solver_tol, max_solver_iter
-        )
+        # 2. Solve CI (orbitals frozen)
+        if c_propagator == "sil":
+            C_new, _ = _sil_solve_C(
+                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, sil_krylov_dim
+            )
+        else:
+            C_new = _cn_solve_C(
+                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, solver_tol, max_solver_iter
+            )
 
         # 3. Update density matrices from new C
         D_invs, ds = _compute_density_quantities(mctdh, C_new)
         P_frozens = [bs[s] @ bs[s].conj().T for s in range(mctdh.num_species)]
 
-        # 4. CN-solve orbitals per species
-        bs_new = _cn_solve_bs(
-            mctdh,
-            bs,
-            h_current,
-            D_invs,
-            ds,
-            bs,
-            P_frozens,
-            dt,
-            b_shapes,
-            solver_tol,
-            max_solver_iter,
-        )
+        # 4. Solve orbitals per species
+        if b_propagator == "sil":
+            bs_new, _ = _sil_solve_bs(
+                mctdh,
+                bs,
+                h_current,
+                D_invs,
+                ds,
+                bs,
+                P_frozens,
+                dt,
+                b_shapes,
+                sil_b_krylov_dim,
+            )
+        else:
+            bs_new = _cn_solve_bs(
+                mctdh,
+                bs,
+                h_current,
+                D_invs,
+                ds,
+                bs,
+                P_frozens,
+                dt,
+                b_shapes,
+                solver_tol,
+                max_solver_iter,
+            )
 
         return t + dt, mctdh._Cb_to_y(C_new, bs_new)
 
