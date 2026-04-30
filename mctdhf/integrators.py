@@ -371,6 +371,53 @@ def _sil_solve_C_bidi(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10
     return c_fwd_flat.reshape(c_shape), c_bwd_flat.reshape(c_shape), sil_error
 
 
+def _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape):
+    """Exact CI propagator via dense diagonalisation of H_CI.
+
+    ITE: replace C by the lowest ``num_states`` eigenvectors of H_CI. The
+    input C is used only as a dtype/shape template — the result is the exact
+    state-averaged MCSCF CI update given the current orbitals (so the dt
+    argument is irrelevant in this branch).
+
+    RTE: form ``exp(-i*dt*H_CI) @ C`` exactly via the eigendecomposition.
+
+    Cheap when prod(num_dets) is small (≲ a few thousand). For larger CI
+    dimensions prefer SIL.
+
+    Returns ``(C_new, error)`` to match the ``_sil_solve_C`` signature; the
+    error estimate is identically zero (diagonalisation is exact in floating
+    point).
+    """
+    num_states = c_shape[0]
+    det_shape = c_shape[1:]
+    n_dets_tot = 1
+    for n in det_shape:
+        n_dets_tot *= int(n)
+
+    # Build the dense CI Hamiltonian by applying get_sigma to the identity in
+    # the determinant basis. dCI.get_sigma uses '...' einsum strings so any
+    # leading batch shape is accepted.
+    eye = jnp.eye(n_dets_tot, dtype=C.dtype).reshape((n_dets_tot,) + det_shape)
+    sigma = mctdh.dCI.get_sigma(eye, h_MO_list, g_MO_dict)
+    H_CI = sigma.reshape(n_dets_tot, n_dets_tot)
+    # Hermitise to clean up floating-point noise before eigh.
+    H_CI = 0.5 * (H_CI + H_CI.conj().T)
+    eigvals, eigvecs = jnp.linalg.eigh(H_CI)  # ascending eigenvalues
+
+    if mctdh.imag_time:
+        # Lowest num_states eigenvectors as the new state-averaged CI vectors.
+        # eigvecs columns -> states; transpose so the leading axis is `state`.
+        C_new = eigvecs[:, :num_states].T.reshape(c_shape)
+    else:
+        # Exact unitary propagation: U @ diag(exp(-i*dt*λ)) @ U† @ C.
+        C_flat = C.reshape(num_states, n_dets_tot)
+        C_eig = C_flat @ eigvecs
+        C_eig = C_eig * jnp.exp(-1j * dt * eigvals)[None, :]
+        C_new = (C_eig @ eigvecs.conj().T).reshape(c_shape)
+
+    return C_new, jnp.zeros((), dtype=eigvals.dtype)
+
+
 def _sil_solve_bs(
     mctdh,
     bs_start,
@@ -584,6 +631,10 @@ def get_cmf_integrator(
         c_propagator: Sub-integrator for CI coefficients. Options:
             'cn' - Crank-Nicolson with BiCGSTAB (default)
             'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp)
+            'diagonalize' - Dense eigh of H_CI. Exact MCSCF-style update in
+                ITE (replaces C by the lowest num_states eigenvectors,
+                independent of dt) and exact propagation in RTE. Cheap when
+                prod(num_dets) is small; ignores sil_krylov_dim.
         b_propagator: Sub-integrator for orbitals. Options:
             'cn' - Crank-Nicolson with BiCGSTAB (default)
             'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp).
@@ -594,8 +645,10 @@ def get_cmf_integrator(
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
-    if c_propagator not in ("cn", "sil"):
-        raise ValueError(f"Unknown c_propagator '{c_propagator}'. Use 'cn' or 'sil'.")
+    if c_propagator not in ("cn", "sil", "diagonalize"):
+        raise ValueError(
+            f"Unknown c_propagator '{c_propagator}'. Use 'cn', 'sil', or 'diagonalize'."
+        )
     if b_propagator not in ("cn", "sil"):
         raise ValueError(f"Unknown b_propagator '{b_propagator}'. Use 'cn' or 'sil'.")
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
@@ -619,6 +672,10 @@ def get_cmf_integrator(
         if c_propagator == "sil":
             C_new, _ = _sil_solve_C(
                 mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, sil_krylov_dim
+            )
+        elif c_propagator == "diagonalize":
+            C_new, _ = _diag_solve_C(
+                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape
             )
         else:
             C_new = _cn_solve_C(
@@ -704,6 +761,11 @@ def get_cmf_half_step_integrator(
         c_propagator: Sub-integrator for CI coefficients. Options:
             'cn' - Crank-Nicolson with BiCGSTAB (default)
             'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp)
+            'diagonalize' - Dense eigh of H_CI. Exact MCSCF-style update in
+                ITE (each predictor/corrector half-step replaces C by the
+                lowest num_states eigenvectors of the current H_CI,
+                independent of dt) and exact propagation in RTE. Cheap when
+                prod(num_dets) is small; ignores sil_krylov_dim.
         b_propagator: Sub-integrator for orbitals. Options:
             'cn' - Crank-Nicolson with BiCGSTAB (default)
             'bs' - Bulirsch-Stoer (modified midpoint + Richardson extrapolation)
@@ -720,8 +782,10 @@ def get_cmf_half_step_integrator(
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
-    if c_propagator not in ("cn", "sil"):
-        raise ValueError(f"Unknown c_propagator '{c_propagator}'. Use 'cn' or 'sil'.")
+    if c_propagator not in ("cn", "sil", "diagonalize"):
+        raise ValueError(
+            f"Unknown c_propagator '{c_propagator}'. Use 'cn', 'sil', or 'diagonalize'."
+        )
     if b_propagator not in ("cn", "bs", "sil"):
         raise ValueError(
             f"Unknown b_propagator '{b_propagator}'. Use 'cn', 'bs', or 'sil'."
@@ -734,168 +798,6 @@ def get_cmf_half_step_integrator(
     dt_half = dt / 2
     n_sub = n_orbital_substeps
 
-    # Claude Code implementation
-    @jax.jit
-    def integrate_cc(t, y):
-        C, bs = mctdh._y_to_Cb(y)
-
-        # ── Predictor: half-step with mean fields at t ──────────────────
-        h_current_t = mctdh._get_h_current(t)
-        h_current_mid = mctdh._get_h_current(t + dt_half)
-
-        # Transform integrals at b(t)
-        h_MO_list_t = [
-            mctdh.transform_h(h_current_t[s], bs[s])[1]
-            for s in range(mctdh.num_species)
-        ]
-        g_MO_dict_t, _ = mctdh._transform_all_g(bs, full=False)
-
-        # CI half-step: C(t) → C(t+dt/2)
-        if c_propagator == "sil":
-            C_half, _ = _sil_solve_C(
-                mctdh, C, h_MO_list_t, g_MO_dict_t, dt_half, c_shape, sil_krylov_dim
-            )
-        else:
-            C_half = _cn_solve_C(
-                mctdh,
-                C,
-                h_MO_list_t,
-                g_MO_dict_t,
-                dt_half,
-                c_shape,
-                solver_tol,
-                max_solver_iter,
-            )
-
-        # Density matrices from C(t+dt/2)
-        D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
-        P_frozens_t = [bs[s] @ bs[s].conj().T for s in range(mctdh.num_species)]
-
-        # Orbital half-step: b(t) → b(t+dt/2)
-        if b_propagator == "sil":
-            bs_half, _ = _sil_solve_bs(
-                mctdh,
-                bs,
-                h_current_t,
-                D_invs_half,
-                ds_half,
-                bs,
-                P_frozens_t,
-                dt_half,
-                b_shapes,
-                sil_b_krylov_dim,
-            )
-        elif b_propagator == "bs":
-            bs_half = _bs_solve_bs(
-                mctdh,
-                bs,
-                h_current_t,
-                D_invs_half,
-                ds_half,
-                bs,
-                P_frozens_t,
-                dt_half,
-                b_shapes,
-                bs_sequence,
-            )
-        else:
-            dt_orb_pred = dt_half / n_sub
-            bs_half = bs
-            for _ in range(n_sub):
-                bs_half = _cn_solve_bs(
-                    mctdh,
-                    bs_half,
-                    h_current_t,
-                    D_invs_half,
-                    ds_half,
-                    bs,
-                    P_frozens_t,
-                    dt_orb_pred,
-                    b_shapes,
-                    solver_tol,
-                    max_solver_iter,
-                )
-
-        # ── Corrector: full step with midpoint mean fields ──────────────
-        # Re-transform integrals at b(t+dt/2)
-        # Use h at t+dt/2 for the corrector (midpoint-centered)
-        h_MO_list_mid = [
-            mctdh.transform_h(h_current_mid[s], bs_half[s])[1]
-            for s in range(mctdh.num_species)
-        ]
-        g_MO_dict_mid, _ = mctdh._transform_all_g(bs_half, full=False)
-
-        # CI full step: C(t) → C(t+dt) using midpoint MO integrals
-        if c_propagator == "sil":
-            C_new, _ = _sil_solve_C(
-                mctdh, C, h_MO_list_mid, g_MO_dict_mid, dt, c_shape, sil_krylov_dim
-            )
-        else:
-            C_new = _cn_solve_C(
-                mctdh,
-                C,
-                h_MO_list_mid,
-                g_MO_dict_mid,
-                dt,
-                c_shape,
-                solver_tol,
-                max_solver_iter,
-            )
-
-        # Density matrices from C(t+dt)
-        D_invs_new, ds_new = _compute_density_quantities(mctdh, C_new)
-        P_frozens_mid = [
-            bs_half[s] @ bs_half[s].conj().T for s in range(mctdh.num_species)
-        ]
-
-        # Orbital full step: b(t) → b(t+dt) using midpoint mean fields
-        if b_propagator == "sil":
-            bs_new, _ = _sil_solve_bs(
-                mctdh,
-                bs,
-                h_current_mid,
-                D_invs_new,
-                ds_new,
-                bs_half,
-                P_frozens_mid,
-                dt,
-                b_shapes,
-                sil_b_krylov_dim,
-            )
-        elif b_propagator == "bs":
-            bs_new = _bs_solve_bs(
-                mctdh,
-                bs,
-                h_current_mid,
-                D_invs_new,
-                ds_new,
-                bs_half,
-                P_frozens_mid,
-                dt,
-                b_shapes,
-                bs_sequence,
-            )
-        else:
-            dt_orb_corr = dt / n_sub
-            bs_new = bs
-            for _ in range(n_sub):
-                bs_new = _cn_solve_bs(
-                    mctdh,
-                    bs_new,
-                    h_current_mid,
-                    D_invs_new,
-                    ds_new,
-                    bs_half,
-                    P_frozens_mid,
-                    dt_orb_corr,
-                    b_shapes,
-                    solver_tol,
-                    max_solver_iter,
-                )
-
-        return t + dt, mctdh._Cb_to_y(C_new, bs_new)
-
-    # Fixed (?) implementation
     @jax.jit
     def integrate(t, y):
         C, bs = mctdh._y_to_Cb(y)
@@ -915,6 +817,10 @@ def get_cmf_half_step_integrator(
         if c_propagator == "sil":
             C_half, _ = _sil_solve_C(
                 mctdh, C, h_MO_list_t, g_MO_dict_t, dt_half, c_shape, sil_krylov_dim
+            )
+        elif c_propagator == "diagonalize":
+            C_half, _ = _diag_solve_C(
+                mctdh, C, h_MO_list_t, g_MO_dict_t, dt_half, c_shape
             )
         else:
             C_half = _cn_solve_C(
@@ -1056,6 +962,15 @@ def get_cmf_half_step_integrator(
                 dt_half,
                 c_shape,
                 sil_krylov_dim,
+            )
+        elif c_propagator == "diagonalize":
+            C_new, _ = _diag_solve_C(
+                mctdh,
+                C_half,
+                h_MO_list_new,
+                g_MO_dict_new,
+                dt_half,
+                c_shape,
             )
         else:
             C_new = _cn_solve_C(

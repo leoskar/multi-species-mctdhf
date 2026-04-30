@@ -82,18 +82,17 @@ class MCTDHF_n_species:
         self.imag_time = imag_time
         self.eps = eps
 
-        # State-averaging weights for orbital optimization.
-        # None → uniform sum (backward-compatible default).
-        # When provided, weights are normalized to sum to 1.
-        if state_weights is not None:
+        # State-averaging weights for orbital optimization. Always normalized
+        # to sum to 1 so _state_average is a true weighted mean.
+        if state_weights is None:
+            w = jnp.ones(num_states, dtype=jnp.float32)
+        else:
             w = jnp.array(state_weights, dtype=jnp.float32)
             if w.shape != (num_states,):
                 raise ValueError(
                     f"state_weights must have shape ({num_states},), got {w.shape}"
                 )
-            self.state_weights = w / jnp.sum(w)
-        else:
-            self.state_weights = None
+        self.state_weights = w / jnp.sum(w)
 
     # ── State vector packing / unpacking ──────────────────────────────────
 
@@ -119,23 +118,7 @@ class MCTDHF_n_species:
         return C, bs_list
 
     def _state_average(self, tensor):
-        """Average a tensor over the leading state axis.
-
-        If state_weights is None, uses uniform sum (backward-compatible).
-        Otherwise, contracts with normalized weights.
-
-        Parameters
-        ----------
-        tensor : jnp.ndarray
-            Tensor with leading state dimension, shape (num_states, ...).
-
-        Returns
-        -------
-        jnp.ndarray
-            State-averaged tensor, shape (...).
-        """
-        if self.state_weights is None:
-            return jnp.sum(tensor, axis=0)
+        """Weighted mean of `tensor` over the leading state axis."""
         return contract("s,s...->...", self.state_weights, tensor, backend="jax")
 
     # ── Integral helpers ──────────────────────────────────────────────────
