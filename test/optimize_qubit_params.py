@@ -169,6 +169,7 @@ def evaluate_params(
     dt=1e-2,
     save_every=100,
     verbose=False,
+    config_weights=None,
 ):
     """Run ITE at (alpha, beta), return qubit fidelities and the final state.
 
@@ -189,6 +190,7 @@ def evaluate_params(
         num_spatial_orbitals=[NUM_DVR] * NUM_WELLS,
         num_states=NUM_STATES,
         imag_time=True,
+        state_weights=np.concatenate([np.ones(1), 0.5*np.ones(4), np.zeros(NUM_STATES-5)])
     )
 
     integrator = get_cmf_integrator(
@@ -235,7 +237,7 @@ def evaluate_params(
     C_final, bs_final = mctdhf._y_to_Cb(y_final)
 
     F = qubit_corner_fidelities(C_final, NUM_WELLS, n_levels=2)
-    matched_idx, fidelities, loss = match_configs(F)
+    matched_idx, fidelities, loss = match_configs(F, weights=config_weights)
 
     if verbose:
         print(f"  loss={loss:.4f}  min_fid={fidelities.min():.4f}")
@@ -256,12 +258,13 @@ def evaluate_params(
 
 def optimize(
     x0=None,
-    num_steps_cold=500,
-    num_steps_warm=100,
+    num_steps_cold=1000,
+    num_steps_warm=200,
     maxiter=200,
     rhobeg=0.1,
     rhoend=1e-3,
     log_path=None,
+    config_weights=None,
 ):
     """Run PyBOBYQA over [alpha_0..alpha_3, beta_0..beta_3] in GHz.
 
@@ -274,7 +277,7 @@ def optimize(
     the previous converged state. Bounds are enforced natively by PyBOBYQA.
     """
     if x0 is None:
-        x0 = np.array([7.0, 8.0, 9.0, 10.0, 0.15, 0.15, 0.15, 0.15])
+        x0 = np.array([7.0, 9.0, 11.0, 13.0, 0.25, 0.25, 0.25, 0.25])
 
     lb = np.array(
         [ALPHA_BOUNDS_GHZ[0]] * NUM_WELLS + [BETA_BOUNDS_GHZ[0]] * NUM_WELLS
@@ -302,6 +305,7 @@ def optimize(
             betas_ghz=x[NUM_WELLS:],
             y_prev=state["y_prev"],
             num_steps=num_steps,
+            config_weights=config_weights,
         )
         loss = result["loss"]
         min_fid = float(result["fidelities"].min())
@@ -351,8 +355,8 @@ def optimize(
         rhoend=rhoend,
         maxfun=maxiter,
         scaling_within_bounds=True,
-        print_progress=True,
-        seek_global_minimum=False,
+        print_progress=False,
+        seek_global_minimum=True,
     )
     wall_total = time.time() - t_start
     print(f"\nOptimisation finished in {wall_total:.1f}s ({state['eval_idx']} evals).")
@@ -422,6 +426,10 @@ def _save_trajectory(log_path, state, soln, wall_total):
 
 
 if __name__ == "__main__":
+
+    name = "_" + sys.argv[1] if len(sys.argv) > 1 else ""
+
     out_dir = os.path.dirname(os.path.abspath(__file__))
-    log_path = os.path.join(out_dir, "optimize_qubit_params_trajectory.npz")
-    state, soln = optimize(log_path=log_path)
+    log_path = os.path.join(out_dir, "optimization_trajectories/" + name + ".npz")
+    config_weights = w = np.array([3.0, 3.,3.,3.,3.,  1.,1.,1.,1.,1.,1.,  0.3,0.3,0.3,0.3,  0.3])
+    state, soln = optimize(log_path=log_path, config_weights=config_weights)
