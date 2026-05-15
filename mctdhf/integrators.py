@@ -509,6 +509,71 @@ def _sil_solve_bs(
     return bs_new, jnp.max(jnp.array(sil_errors))
 
 
+def _diag_solve_bs(
+    mctdh,
+    bs_start,
+    h_current,
+    D_invs,
+    ds,
+    bs_frozen,
+    P_frozens,
+    dt,
+    b_shapes,
+):
+    """Exact orbital propagator via dense matrix exponential of A_s.
+
+    For each species s, builds A_s as a dense (N_s, N_s) matrix where
+    N_s = n_spatial_s * M_s by applying _rhs_b_linear to the standard
+    basis vectors of the flat orbital space, then propagates exactly:
+
+        b_new_flat = jax.scipy.linalg.expm(factor · dt · A_s) @ b_flat
+
+    with `factor = -1.0` (ITE) or `-1j` (RTE).
+
+    The propagator is exact in the linearised (frozen-coefficient) CMF
+    substep ODE. Sign convention follows _sil_solve_bs: extract A_s from
+    _rhs_b_linear by negating (ITE) or multiplying by 1j (RTE). Under the
+    current (1-P)·(h+W)·D⁻¹ MCTDHF gauge A_s is non-Hermitian (asymmetry
+    ratio ~0.5 on the standard test system), so eigh is not applicable;
+    expm handles the general case at modest extra cost.
+
+    Cheap when n_spatial · n_orb is small (≲ a few hundred per species);
+    for larger orbital dimensions prefer SIL or CN.
+
+    Returns (bs_new, zero_error) to match _sil_solve_bs's tuple shape.
+    """
+    bs_new = list(bs_start)
+    err_dtype = bs_start[0].real.dtype
+    for s in range(mctdh.num_species):
+        b_s = bs_start[s]
+        b_flat = b_s.reshape(-1)
+        N_s = b_shapes[s][0] * b_shapes[s][1]
+
+        def apply_once(b, _s=s):
+            rhs = mctdh._rhs_b_linear(
+                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, P_frozens[_s]
+            )
+            return rhs.reshape(-1)
+
+        # Build dense linear operator by vmapping apply_once over standard
+        # basis vectors of the flat (n_spatial · M) orbital space.
+        I_cols = jnp.eye(N_s, dtype=b_s.dtype).reshape((N_s,) + b_shapes[s])
+        J_rows = jax.vmap(apply_once)(I_cols)   # row k = J · e_k
+        J_mat = J_rows.T                         # columns = J · e_k → J as matrix
+
+        # Extract A_s from _rhs_b_linear sign convention.
+        if mctdh.imag_time:
+            A_s = -J_mat
+            expA = jax.scipy.linalg.expm(-dt * A_s)
+        else:
+            A_s = 1j * J_mat
+            expA = jax.scipy.linalg.expm(-1j * dt * A_s)
+
+        bs_new[s] = (expA @ b_flat).reshape(b_shapes[s])
+
+    return bs_new, jnp.zeros((), dtype=err_dtype)
+
+
 def _bs_modified_midpoint(rhs_fn, y0, dt, n_steps):
     """Modified midpoint method with n_steps subdivisions and smoothing.
 
@@ -600,21 +665,52 @@ def _compute_density_quantities(mctdh, C):
     return D_invs, ds
 
 
+def _validate_kwargs(kwargs, recognised, dict_name, propagator_name):
+    """Raise ValueError if any key in `kwargs` is not in `recognised`.
+
+    The error message lists the recognised keys for the given propagator
+    so typos are easy to fix.
+    """
+    extras = set(kwargs) - set(recognised)
+    if extras:
+        raise ValueError(
+            f"{dict_name} contains unrecognised key(s) {sorted(extras)} for "
+            f"propagator '{propagator_name}'. Recognised keys: "
+            f"{sorted(recognised) or 'none'}."
+        )
+
+
+_C_KWARG_KEYS = {
+    "cn": ("solver_tol", "max_solver_iter"),
+    "sil": ("krylov_dim",),
+    "diagonalize": (),
+}
+_B_KWARG_KEYS_CMF = {
+    "cn": ("solver_tol", "max_solver_iter"),
+    "sil": ("krylov_dim",),
+    "diagonalize": (),
+}
+_B_KWARG_KEYS_HALF = {
+    "cn": ("solver_tol", "max_solver_iter", "n_orbital_substeps"),
+    "sil": ("krylov_dim",),
+    "bs": ("bs_sequence",),
+    "diagonalize": (),
+}
+
+
 def get_cmf_integrator(
     mctdh,
     dt,
-    solver_tol=1e-8,
-    max_solver_iter=100,
     c_propagator="cn",
     b_propagator="cn",
-    sil_krylov_dim=10,
-    sil_b_krylov_dim=20,
+    c_kwargs=None,
+    b_kwargs=None,
 ):
     """Constant Mean Field (CMF) integrator.
 
-    Decouples the CI and orbital propagation, making each sub-problem
-    linear. The sub-problems can be solved with Crank-Nicolson (CN) or
-    Short Iterative Lanczos (SIL).
+    Decouples CI and orbital propagation. Each sub-problem becomes linear
+    in its own variable with the other frozen, and any of CN/SIL/
+    diagonalize can solve it.
 
     This allows dt 100-1000× larger than Picard-iteration CN because
     the decoupled sub-problems are genuinely linear and can be solved
@@ -626,31 +722,60 @@ def get_cmf_integrator(
     Args:
         mctdh: MCTDHF_n_species instance.
         dt: Time step.
-        solver_tol: Convergence tolerance for BiCGSTAB (CN only).
-        max_solver_iter: Maximum BiCGSTAB iterations (CN only).
-        c_propagator: Sub-integrator for CI coefficients. Options:
-            'cn' - Crank-Nicolson with BiCGSTAB (default)
-            'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp)
+        c_propagator: Sub-integrator for CI coefficients. One of:
+            'cn'          - Crank-Nicolson with BiCGSTAB (default)
+            'sil'         - Short Iterative Lanczos (Krylov + matrix exp)
             'diagonalize' - Dense eigh of H_CI. Exact MCSCF-style update in
-                ITE (replaces C by the lowest num_states eigenvectors,
-                independent of dt) and exact propagation in RTE. Cheap when
-                prod(num_dets) is small; ignores sil_krylov_dim.
-        b_propagator: Sub-integrator for orbitals. Options:
-            'cn' - Crank-Nicolson with BiCGSTAB (default)
-            'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp).
-                Recommended for large DVR grids where dt * max(h) >> 1.
-        sil_krylov_dim: Krylov subspace dimension for CI SIL (default 10).
-        sil_b_krylov_dim: Krylov subspace dimension for orbital SIL (default 20).
+                            ITE (replaces C by the lowest num_states
+                            eigenvectors, independent of dt) and exact
+                            propagation in RTE. Cheap when prod(num_dets)
+                            is small.
+        b_propagator: Sub-integrator for orbitals. One of:
+            'cn'          - Crank-Nicolson with BiCGSTAB (default)
+            'sil'         - Short Iterative Lanczos. Recommended for large
+                            DVR grids where dt * max(h) >> 1.
+            'diagonalize' - Dense matrix exponential of A_s (the linearised
+                            substep operator). Exact in the linearised
+                            ODE. Cheap when n_spatial · n_orb is small
+                            (≲ a few hundred per species). Autodiff-clean.
+        c_kwargs: Dict of solver-specific options for the chosen
+            c_propagator. Recognised keys (defaults in parens):
+              cn:           solver_tol (1e-8), max_solver_iter (100)
+              sil:          krylov_dim (10)
+              diagonalize:  (none)
+        b_kwargs: Dict of solver-specific options for the chosen
+            b_propagator. Recognised keys (defaults in parens):
+              cn:           solver_tol (1e-8), max_solver_iter (100)
+              sil:          krylov_dim (20)
+              diagonalize:  (none)
 
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
     if c_propagator not in ("cn", "sil", "diagonalize"):
         raise ValueError(
-            f"Unknown c_propagator '{c_propagator}'. Use 'cn', 'sil', or 'diagonalize'."
+            f"Unknown c_propagator '{c_propagator}'. "
+            f"Use 'cn', 'sil', or 'diagonalize'."
         )
-    if b_propagator not in ("cn", "sil"):
-        raise ValueError(f"Unknown b_propagator '{b_propagator}'. Use 'cn' or 'sil'.")
+    if b_propagator not in ("cn", "sil", "diagonalize"):
+        raise ValueError(
+            f"Unknown b_propagator '{b_propagator}'. "
+            f"Use 'cn', 'sil', or 'diagonalize'."
+        )
+
+    c_kwargs = dict(c_kwargs or {})
+    b_kwargs = dict(b_kwargs or {})
+    _validate_kwargs(c_kwargs, _C_KWARG_KEYS[c_propagator], "c_kwargs", c_propagator)
+    _validate_kwargs(b_kwargs, _B_KWARG_KEYS_CMF[b_propagator], "b_kwargs", b_propagator)
+
+    c_solver_tol = c_kwargs.get("solver_tol", 1e-8)
+    c_max_iter = c_kwargs.get("max_solver_iter", 100)
+    c_krylov_dim = c_kwargs.get("krylov_dim", 10)
+
+    b_solver_tol = b_kwargs.get("solver_tol", 1e-8)
+    b_max_iter = b_kwargs.get("max_solver_iter", 100)
+    b_krylov_dim = b_kwargs.get("krylov_dim", 20)
+
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
     b_shapes = [
         (mctdh.num_spatial_orbitals[s], mctdh.num_mctdhf_orbitals[s])
@@ -671,7 +796,7 @@ def get_cmf_integrator(
         # 2. Solve CI (orbitals frozen)
         if c_propagator == "sil":
             C_new, _ = _sil_solve_C(
-                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, sil_krylov_dim
+                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, c_krylov_dim
             )
         elif c_propagator == "diagonalize":
             C_new, _ = _diag_solve_C(
@@ -679,7 +804,7 @@ def get_cmf_integrator(
             )
         else:
             C_new = _cn_solve_C(
-                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, solver_tol, max_solver_iter
+                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, c_solver_tol, c_max_iter
             )
 
         # 3. Update density matrices from new C
@@ -698,7 +823,19 @@ def get_cmf_integrator(
                 P_frozens,
                 dt,
                 b_shapes,
-                sil_b_krylov_dim,
+                b_krylov_dim,
+            )
+        elif b_propagator == "diagonalize":
+            bs_new, _ = _diag_solve_bs(
+                mctdh,
+                bs,
+                h_current,
+                D_invs,
+                ds,
+                bs,
+                P_frozens,
+                dt,
+                b_shapes,
             )
         else:
             bs_new = _cn_solve_bs(
@@ -711,8 +848,8 @@ def get_cmf_integrator(
                 P_frozens,
                 dt,
                 b_shapes,
-                solver_tol,
-                max_solver_iter,
+                b_solver_tol,
+                b_max_iter,
             )
 
         return t + dt, mctdh._Cb_to_y(C_new, bs_new)
@@ -723,14 +860,10 @@ def get_cmf_integrator(
 def get_cmf_half_step_integrator(
     mctdh,
     dt,
-    solver_tol=1e-8,
-    max_solver_iter=100,
-    n_orbital_substeps=1,
     c_propagator="cn",
     b_propagator="cn",
-    sil_krylov_dim=10,
-    sil_b_krylov_dim=20,
-    bs_sequence=(2, 4, 6, 8, 12, 16),
+    c_kwargs=None,
+    b_kwargs=None,
 ):
     """Improved CMF integrator with half-step predictor-corrector.
 
@@ -750,53 +883,65 @@ def get_cmf_half_step_integrator(
     Args:
         mctdh: MCTDHF_n_species instance.
         dt: Time step.
-        solver_tol: Convergence tolerance for BiCGSTAB (CN only).
-        max_solver_iter: Maximum BiCGSTAB iterations (CN only).
-        n_orbital_substeps: Number of sub-steps for the orbital CN solves.
-            The mean fields (density matrices, projectors, MO integrals)
-            remain frozen; only the orbital time integration is refined.
-            Useful when the orbital EOM is stiffer than the CI EOM (e.g.
-            large spatial grids). Default 1 (no sub-stepping). Only used
-            when b_propagator='cn'.
-        c_propagator: Sub-integrator for CI coefficients. Options:
-            'cn' - Crank-Nicolson with BiCGSTAB (default)
-            'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp)
-            'diagonalize' - Dense eigh of H_CI. Exact MCSCF-style update in
-                ITE (each predictor/corrector half-step replaces C by the
-                lowest num_states eigenvectors of the current H_CI,
-                independent of dt) and exact propagation in RTE. Cheap when
-                prod(num_dets) is small; ignores sil_krylov_dim.
-        b_propagator: Sub-integrator for orbitals. Options:
-            'cn' - Crank-Nicolson with BiCGSTAB (default)
-            'bs' - Bulirsch-Stoer (modified midpoint + Richardson extrapolation)
-            'sil' - Short Iterative Lanczos (Krylov subspace + matrix exp).
-                Recommended for large DVR grids where dt * max(h) >> 1.
-        sil_krylov_dim: Krylov subspace dimension for CI SIL (default 10).
-        sil_b_krylov_dim: Krylov subspace dimension for orbital SIL (default 20).
-            Needs to be larger than sil_krylov_dim because the orbital
-            Hamiltonian in the spatial basis is much stiffer than the CI
-            Hamiltonian in the MO basis.
-        bs_sequence: Subdivision sequence for Bulirsch-Stoer extrapolation.
-            Default (2, 4, 6, 8, 12, 16).
+        c_propagator: Sub-integrator for CI coefficients. One of:
+            'cn'          - Crank-Nicolson with BiCGSTAB (default)
+            'sil'         - Short Iterative Lanczos
+            'diagonalize' - Dense eigh of H_CI; exact in the linearised
+                            substep.
+        b_propagator: Sub-integrator for orbitals. One of:
+            'cn'          - Crank-Nicolson with BiCGSTAB (default)
+            'bs'          - Bulirsch-Stoer (modified midpoint + Richardson)
+            'sil'         - Short Iterative Lanczos
+            'diagonalize' - Dense matrix exponential of A_s; exact in the
+                            linearised substep, autodiff-clean.
+        c_kwargs: Dict of solver-specific options for the chosen
+            c_propagator. Recognised keys (defaults in parens):
+              cn:           solver_tol (1e-8), max_solver_iter (100)
+              sil:          krylov_dim (10)
+              diagonalize:  (none)
+        b_kwargs: Dict of solver-specific options for the chosen
+            b_propagator. Recognised keys (defaults in parens):
+              cn:           solver_tol (1e-8), max_solver_iter (100),
+                            n_orbital_substeps (1)
+              sil:          krylov_dim (20)
+              bs:           bs_sequence ((2,4,6,8,12,16))
+              diagonalize:  (none)
 
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
     if c_propagator not in ("cn", "sil", "diagonalize"):
         raise ValueError(
-            f"Unknown c_propagator '{c_propagator}'. Use 'cn', 'sil', or 'diagonalize'."
+            f"Unknown c_propagator '{c_propagator}'. "
+            f"Use 'cn', 'sil', or 'diagonalize'."
         )
-    if b_propagator not in ("cn", "bs", "sil"):
+    if b_propagator not in ("cn", "bs", "sil", "diagonalize"):
         raise ValueError(
-            f"Unknown b_propagator '{b_propagator}'. Use 'cn', 'bs', or 'sil'."
+            f"Unknown b_propagator '{b_propagator}'. "
+            f"Use 'cn', 'bs', 'sil', or 'diagonalize'."
         )
+
+    c_kwargs = dict(c_kwargs or {})
+    b_kwargs = dict(b_kwargs or {})
+    _validate_kwargs(c_kwargs, _C_KWARG_KEYS[c_propagator], "c_kwargs", c_propagator)
+    _validate_kwargs(b_kwargs, _B_KWARG_KEYS_HALF[b_propagator], "b_kwargs", b_propagator)
+
+    c_solver_tol = c_kwargs.get("solver_tol", 1e-8)
+    c_max_iter = c_kwargs.get("max_solver_iter", 100)
+    c_krylov_dim = c_kwargs.get("krylov_dim", 10)
+
+    b_solver_tol = b_kwargs.get("solver_tol", 1e-8)
+    b_max_iter = b_kwargs.get("max_solver_iter", 100)
+    b_krylov_dim = b_kwargs.get("krylov_dim", 20)
+    n_sub = b_kwargs.get("n_orbital_substeps", 1)
+    bs_sequence = b_kwargs.get("bs_sequence", (2, 4, 6, 8, 12, 16))
+
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
     b_shapes = [
         (mctdh.num_spatial_orbitals[s], mctdh.num_mctdhf_orbitals[s])
         for s in range(mctdh.num_species)
     ]
     dt_half = dt / 2
-    n_sub = n_orbital_substeps
 
     @jax.jit
     def integrate(t, y):
@@ -816,7 +961,7 @@ def get_cmf_half_step_integrator(
         # CI half-step: C(t) → C(t+dt/2)
         if c_propagator == "sil":
             C_half, _ = _sil_solve_C(
-                mctdh, C, h_MO_list_t, g_MO_dict_t, dt_half, c_shape, sil_krylov_dim
+                mctdh, C, h_MO_list_t, g_MO_dict_t, dt_half, c_shape, c_krylov_dim
             )
         elif c_propagator == "diagonalize":
             C_half, _ = _diag_solve_C(
@@ -830,8 +975,8 @@ def get_cmf_half_step_integrator(
                 g_MO_dict_t,
                 dt_half,
                 c_shape,
-                solver_tol,
-                max_solver_iter,
+                c_solver_tol,
+                c_max_iter,
             )
 
         # Density matrices from C(t)
@@ -850,7 +995,7 @@ def get_cmf_half_step_integrator(
                 P_frozens_t,
                 dt_half,
                 b_shapes,
-                sil_b_krylov_dim,
+                b_krylov_dim,
             )
         elif b_propagator == "bs":
             bs_half = _bs_solve_bs(
@@ -864,6 +1009,18 @@ def get_cmf_half_step_integrator(
                 dt_half,
                 b_shapes,
                 bs_sequence,
+            )
+        elif b_propagator == "diagonalize":
+            bs_half, _ = _diag_solve_bs(
+                mctdh,
+                bs,
+                h_current_t,
+                D_invs_t,
+                ds_t,
+                bs,
+                P_frozens_t,
+                dt_half,
+                b_shapes,
             )
         else:
             dt_orb_pred = dt_half / n_sub
@@ -879,19 +1036,12 @@ def get_cmf_half_step_integrator(
                     P_frozens_t,
                     dt_orb_pred,
                     b_shapes,
-                    solver_tol,
-                    max_solver_iter,
+                    b_solver_tol,
+                    b_max_iter,
                 )
 
         # ── Corrector: full step with midpoint mean fields ──────────────
-        # Re-transform integrals at b(t+dt/2)
-        # Use h at t+dt/2 for the corrector (midpoint-centered)
-        h_MO_list_half = [
-            mctdh.transform_h(h_current_half[s], bs_half[s])[1]
-            for s in range(mctdh.num_species)
-        ]
-        g_MO_dict_half, _ = mctdh._transform_all_g(bs_half, full=False)
-
+        
         # Density matrices from C(t+dt/2)
         D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
         P_frozens_half = [
@@ -910,7 +1060,7 @@ def get_cmf_half_step_integrator(
                 P_frozens_half,
                 dt,
                 b_shapes,
-                sil_b_krylov_dim,
+                b_krylov_dim,
             )
         elif b_propagator == "bs":
             bs_new = _bs_solve_bs(
@@ -924,6 +1074,18 @@ def get_cmf_half_step_integrator(
                 dt,
                 b_shapes,
                 bs_sequence,
+            )
+        elif b_propagator == "diagonalize":
+            bs_new, _ = _diag_solve_bs(
+                mctdh,
+                bs,
+                h_current_half,
+                D_invs_half,
+                ds_half,
+                bs_half,
+                P_frozens_half,
+                dt,
+                b_shapes,
             )
         else:
             dt_orb_corr = dt / n_sub
@@ -939,8 +1101,8 @@ def get_cmf_half_step_integrator(
                     P_frozens_half,
                     dt_orb_corr,
                     b_shapes,
-                    solver_tol,
-                    max_solver_iter,
+                    b_solver_tol,
+                    b_max_iter,
                 )
 
         h_current_new = mctdh._get_h_current(t + dt)
@@ -961,7 +1123,7 @@ def get_cmf_half_step_integrator(
                 g_MO_dict_new,
                 dt_half,
                 c_shape,
-                sil_krylov_dim,
+                c_krylov_dim,
             )
         elif c_propagator == "diagonalize":
             C_new, _ = _diag_solve_C(
@@ -980,8 +1142,8 @@ def get_cmf_half_step_integrator(
                 g_MO_dict_new,
                 dt_half,
                 c_shape,
-                solver_tol,
-                max_solver_iter,
+                c_solver_tol,
+                c_max_iter,
             )
 
         return t + dt, mctdh._Cb_to_y(C_new, bs_new)
@@ -1061,12 +1223,6 @@ def get_adaptive_cmf_half_step_integrator(
         )
 
         # ── Corrector: full step with midpoint mean fields ──────────────
-        h_MO_list_half = [
-            mctdh.transform_h(h_current_half[s], bs_half[s])[1]
-            for s in range(mctdh.num_species)
-        ]
-        g_MO_dict_half, _ = mctdh._transform_all_g(bs_half, full=False)
-
         # Density matrices from C(t+dt/2)
         D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
         P_frozens_half = [
@@ -1123,7 +1279,9 @@ def get_adaptive_cmf_half_step_integrator(
     return adaptive_step
 
 
-def get_vmf_integrator(mctdh, dt, num_newton=3, solver_tol=1e-8, max_solver_iter=50):
+def get_vmf_integrator(
+    mctdh, dt, num_newton=3, min_solver_tol=1e-8, max_solver_tol=1e-2, max_solver_iter=50, precondition=True
+):
     """Variable Mean Field integrator using implicit midpoint + Newton-Krylov.
 
     Uses the implicit midpoint rule, which is symplectic (preserves norm
@@ -1140,6 +1298,15 @@ def get_vmf_integrator(mctdh, dt, num_newton=3, solver_tol=1e-8, max_solver_iter
     with Krylov solves), but the absence of splitting error and symplectic
     structure often allow significantly larger dt.
 
+    The optional block-diagonal preconditioner targets the orbital one-body
+    Jacobian block via precomputed eigh(h_list[s]). This is the dominant
+    source of stiffness (DVR kinetic energy spectrum) and the preconditioner
+    clusters eigenvalues of M⁻¹·A near 1, significantly reducing BiCGSTAB
+    iteration counts and enabling larger time steps. The CI block uses
+    identity (small and not stiff). For time-dependent h, the preconditioner
+    stays anchored to the static reference — still effective if the driving
+    is perturbative relative to T+V_static.
+
     Args:
         mctdh: MCTDHF_n_species instance. Its __call__ method is used as
                the full (coupled) RHS.
@@ -1147,19 +1314,41 @@ def get_vmf_integrator(mctdh, dt, num_newton=3, solver_tol=1e-8, max_solver_iter
         num_newton: Number of Newton iterations per step.
         solver_tol: BiCGSTAB convergence tolerance for Newton linear systems.
         max_solver_iter: Maximum BiCGSTAB iterations per Newton step.
+        precondition: If True (default), use a block-diagonal preconditioner
+            for the orbital one-body Jacobian block. The preconditioner is
+            built from precomputed eigendecompositions of h_list[s] and
+            applies M⁻¹ = (I + α·h_s)⁻¹ spectrally per species. Set to
+            False to recover the original unpreconditioned BiCGSTAB.
 
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
     t_half = dt / 2
 
+    # ── One-time eigendecomposition for the preconditioner ────────────
+    if precondition:
+        alpha = (dt / 2) if mctdh.imag_time else (1j * dt / 2)
+        eig_data = []  # list of (Q_s, inv_factors_s) per species
+        h_static = mctdh._get_h_current(0.0)
+        for s in range(mctdh.num_species):
+            h_s = jnp.asarray(h_static[s])                # (N_s, N_s)
+            D_s, Q_s = jnp.linalg.eigh(h_s)               # D_s real, Q_s unitary
+            inv_factors = 1.0 / (1.0 + alpha * D_s)        # (N_s,)
+            eig_data.append((Q_s, inv_factors))
+    else:
+        eig_data = None
+
     @jax.jit
     def integrate(t, y):
         t_mid = t + t_half
 
-        # Initial guess: explicit Euler
+        # Initial guess: explicit midpoint predictor (order 2).
+        # Gives O(dt³) error in z₀ vs Euler's O(dt²), which can save a
+        # Newton iteration at larger dt.
         f0 = mctdh(t, y)
-        z = y + dt * f0
+        y_half_pred = y + t_half * f0
+        f_half = mctdh(t_mid, y_half_pred)
+        z = y + dt * f_half
 
         # Newton iterations to solve the implicit midpoint equation:
         #   G(z) = z - y - dt * f(t_mid, (z + y)/2) = 0
@@ -1167,27 +1356,69 @@ def get_vmf_integrator(mctdh, dt, num_newton=3, solver_tol=1e-8, max_solver_iter
         # Newton update: G'(z) · δz = -G(z)
         #   G'(z) · v = v - (dt/2) · J_f(y_mid) · v
         # where J_f · v is computed via jax.jvp.
-        def newton_step(z, _):
+        #
+        # Eisenstat–Walker adaptive tolerance: early Newton steps have
+        # large residuals and don't need tight BiCGSTAB solves. We set
+        # tol_k = max(solver_tol, min(0.5, ‖G(z_k)‖/‖G(z_0)‖)).
+        def newton_step(carry, _):
+            z, res_norm_0 = carry
             y_mid = (z + y) / 2
-            f_mid = mctdh(t_mid, y_mid)
+
+            # Linearize: compute f_mid AND cache intermediates for JVP.
+            # Each BiCGSTAB matvec then only computes the tangent (~1x RHS)
+            # instead of recomputing both primals and tangents (~2x RHS).
+            f_mid, jvp_fn = jax.linearize(
+                lambda yy: mctdh(t_mid, yy), y_mid
+            )
             residual = z - y - dt * f_mid
 
+            # Adaptive tolerance (Eisenstat–Walker)
+            res_norm = jnp.linalg.norm(residual)
+            # First iteration: res_norm_0 is 0 → initialize it
+            res_norm_0 = jnp.where(res_norm_0 == 0.0, res_norm, res_norm_0)
+            adaptive_tol = jnp.maximum(
+                min_solver_tol,
+                jnp.minimum(max_solver_tol, res_norm / res_norm_0),
+            )
+
             def matvec(v):
-                _, Jv = jax.jvp(lambda yy: mctdh(t_mid, yy), (y_mid,), (v,))
-                return v - t_half * Jv
+                return v - t_half * jvp_fn(v)
+
+            # Initial guess: M⁻¹·(-residual) ≈ A⁻¹·(-residual) when the
+            # preconditioner is available; -residual otherwise.
+            neg_res = -residual
+            x0 = _apply_M_inv(neg_res) if eig_data is not None else neg_res
 
             dz, _ = jax.scipy.sparse.linalg.bicgstab(
                 matvec,
-                -residual,
-                x0=jnp.zeros_like(residual),
-                tol=solver_tol,
+                neg_res,
+                x0=x0,
+                tol=adaptive_tol,
                 maxiter=max_solver_iter,
+                M=_apply_M_inv if eig_data is not None else None,
             )
-            return z + dz, None
+            return (z + dz, res_norm_0), None
 
-        z, _ = jax.lax.scan(newton_step, z, None, length=num_newton)
+        (z, _), _ = jax.lax.scan(
+            newton_step, (z, jnp.array(0.0, dtype=z.dtype)), None, length=num_newton
+        )
 
         return t + dt, z
+
+    # ── Preconditioner: block-diagonal M⁻¹ ───────────────────────────
+    # Identity on the CI block; spectral inverse (I + α·h_s)⁻¹ on each
+    # orbital block b_s. Cost per application: K × 2 × N²·M flops +
+    # K × N·M complex divides — negligible vs one JVP.
+    def _apply_M_inv(v):
+        v_C, v_bs = mctdh._y_to_Cb(v)
+        v_bs_new = []
+        for s, (Q_s, inv_factors) in enumerate(eig_data):
+            # v_bs[s] shape: (N_s, M_s) — apply M⁻¹ to each orbital column.
+            u = Q_s.conj().T @ v_bs[s]          # rotate to eigenbasis  (N_s, M_s)
+            u = inv_factors[:, None] * u         # diagonal scale per eigenmode
+            u = Q_s @ u                          # back to DVR basis
+            v_bs_new.append(u)
+        return mctdh._Cb_to_y(v_C, v_bs_new)
 
     return integrate
 
@@ -1199,7 +1430,20 @@ def get_psi_integrator(mctdh, dt):
     matrix inverse D⁻¹. Provides exact norm conservation (up to time
     discretization) via QR decomposition.
 
-    Requires num_states=1 and all M_s equal (Tucker rank constraint).
+    Constraints (enforced at construction):
+      - num_states == 1.
+      - num_particles[s] == 1 for every species s.
+      - Square-matricization rank constraint: M_s == ∏_{k≠s} M_k for every
+        species s. This is stricter than the standard PSI condition
+        (M_s ≤ ∏_{k≠s} M_k); it is required here because the QR step
+        replaces b_s by Q and the C-slice along mode s by R in one shot,
+        which only closes when K_(s) is square (so R is M_s × M_s).
+
+    The rank constraint has only trivial solutions for N ≥ 3 species:
+    setting M_s == ∏_{k≠s} M_k for every s collapses (by substitution) to
+    M_s == 1 for all s. So in practice this implementation is usable
+    only for N == 2 species (any equal M_0 == M_1) or for the trivial
+    N ≥ 3 case with all M_s == 1.
 
     Args:
         mctdh: MCTDHF_n_species instance (1 particle per species).

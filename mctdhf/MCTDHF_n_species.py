@@ -13,6 +13,7 @@ import jax.numpy as jnp
 from jax import jit
 from opt_einsum import contract
 from functools import partial
+from scipy.special import comb
 import numpy as np
 import itertools
 
@@ -22,6 +23,44 @@ from .integrators import (
     get_crank_nicolson_fixed_iter,
     get_adaptive_cmf_half_step_integrator,
 )
+
+
+def pack_Cb_to_y(C, bs_list):
+    """Pack CI coefficients C and orbital matrices bs into flat vector y."""
+    C_flat = C.reshape(-1)
+    bs_flat = [b.reshape(-1) for b in bs_list]
+    return jnp.concatenate([C_flat] + bs_flat)
+
+
+def unpack_y_to_Cb(
+    y,
+    num_states,
+    num_particles,
+    num_spatial_orbitals,
+    num_mctdhf_orbitals,
+):
+    """Unpack flat vector y into CI coefficients C and orbital matrices bs.
+
+    `num_dets` is derived from `num_particles` and `num_mctdhf_orbitals`
+    as the binomial coefficient per species (matches SemiDirectCI_n_species).
+    """
+    num_species = len(num_spatial_orbitals)
+    num_dets = tuple(
+        comb(num_mctdhf_orbitals[s], num_particles[s], exact=True) for s in range(num_species)
+    )
+
+    c_size = int(np.prod(num_dets)) * num_states
+    C = y[:c_size].reshape((num_states,) + num_dets)
+
+    start = c_size
+    bs_list = []
+    for s in range(num_species):
+        b_size = num_spatial_orbitals[s] * num_mctdhf_orbitals[s]
+        b_shape = (num_spatial_orbitals[s], num_mctdhf_orbitals[s])
+        bs_list.append(y[start : start + b_size].reshape(b_shape))
+        start += b_size
+
+    return C, bs_list
 
 
 class MCTDHF_n_species:
@@ -97,25 +136,16 @@ class MCTDHF_n_species:
     # ── State vector packing / unpacking ──────────────────────────────────
 
     def _Cb_to_y(self, C, bs_list):
-        """Pack CI coefficients C and orbital matrices bs into flat vector y."""
-        C_flat = C.reshape(-1)
-        bs_flat = [b.reshape(-1) for b in bs_list]
-        return jnp.concatenate([C_flat] + bs_flat)
+        return pack_Cb_to_y(C, bs_list)
 
     def _y_to_Cb(self, y):
-        """Unpack flat vector y into CI coefficients C and orbital matrices bs."""
-        c_size = np.prod(self.num_dets) * self.num_states
-        C = y[:c_size].reshape((self.num_states,) + tuple(self.num_dets))
-
-        start = c_size
-        bs_list = []
-        for s in range(self.num_species):
-            b_size = self.num_spatial_orbitals[s] * self.num_mctdhf_orbitals[s]
-            b_shape = (self.num_spatial_orbitals[s], self.num_mctdhf_orbitals[s])
-            bs_list.append(y[start : start + b_size].reshape(b_shape))
-            start += b_size
-
-        return C, bs_list
+        return unpack_y_to_Cb(
+            y,
+            num_states=self.num_states,
+            num_particles=self.num_particles,
+            num_spatial_orbitals=self.num_spatial_orbitals,
+            num_mctdhf_orbitals=self.num_mctdhf_orbitals,
+        )
 
     def _state_average(self, tensor):
         """Weighted mean of `tensor` over the leading state axis."""

@@ -31,7 +31,12 @@ def _sa_1rdms(mctdh, C):
     Uses a uniform sum over states (matching the orbital optimizer's
     ``_state_average`` when ``state_weights`` is ``None``).
     """
-    return [np.array(jnp.sum(D, axis=0)) for D in mctdh.dCI.get_1p_RDMs(C)]
+    return [
+        np.array(jnp.sum(D, axis=0)).astype(
+            np.complex128 if np.iscomplexobj(D) else np.float64, copy=False
+        )
+        for D in mctdh.dCI.get_1p_RDMs(C)
+    ]
 
 
 def _canonical_phase(V):
