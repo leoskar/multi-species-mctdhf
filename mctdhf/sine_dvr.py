@@ -67,22 +67,22 @@ class SineDVR:
         
         # Box length
         self.L = x_max - x_min
-        
+
         # Grid spacing
         self.dx = self.L / (num_points + 1)
-        
+
         # DVR grid points (interior points only)
-        self.grid = x_min + self.dx * np.arange(1, num_points + 1)
-        
+        self.grid = x_min + self.dx * jnp.arange(1, num_points + 1)
+
         # Compute kinetic energy matrix elements via FBR-DVR transformation
         self.T = self._compute_kinetic_energy()
-        
+
         # Compute first derivative matrix via FBR-DVR transformation
         self.D = self._compute_first_derivative()
-        
+
         # For DVR, spf is identity (basis functions are delta functions at grid points)
         # But for density calculations, we need sqrt(dx) normalization
-        self.spf = np.eye(num_points) / np.sqrt(self.dx)
+        self.spf = jnp.eye(num_points) / jnp.sqrt(self.dx)
     
     def _compute_kinetic_energy(self):
         """Compute the kinetic energy matrix elements.
@@ -100,24 +100,24 @@ class SineDVR:
         """
         N = self.num_points
         L = self.L
-        
+
         # FBR-to-DVR transformation matrix
         # U_jn = sqrt(2/(N+1)) * sin(n*pi*j/(N+1))
         # j = 1, 2, ..., N (DVR points)
         # n = 1, 2, ..., N (FBR basis functions)
-        j = np.arange(1, N + 1)
-        n = np.arange(1, N + 1)
-        
+        j = jnp.arange(1, N + 1)
+        n = jnp.arange(1, N + 1)
+
         # Create the transformation matrix
-        U = np.sqrt(2.0 / (N + 1)) * np.sin(np.outer(j, n) * np.pi / (N + 1))
-        
+        U = jnp.sqrt(2.0 / (N + 1)) * jnp.sin(jnp.outer(j, n) * jnp.pi / (N + 1))
+
         # FBR kinetic energy eigenvalues: T_nn = (hbar^2/2m) * (n*pi/L)^2
         # With hbar = 1 in atomic units
-        T_FBR_diag = (n * np.pi / L) ** 2 / (2 * self.mass)
-        
+        T_FBR_diag = (n * jnp.pi / L) ** 2 / (2 * self.mass)
+
         # Transform to DVR: T_DVR = U @ diag(T_FBR) @ U^T
-        T = U @ np.diag(T_FBR_diag) @ U.T
-        
+        T = U @ jnp.diag(T_FBR_diag) @ U.T
+
         return T
 
     def _compute_first_derivative(self):
@@ -139,24 +139,24 @@ class SineDVR:
         """
         N = self.num_points
         L = self.L
-        
+
         # FBR-to-DVR transformation matrix (same as for kinetic energy)
-        j = np.arange(1, N + 1)
-        n = np.arange(1, N + 1)
-        U = np.sqrt(2.0 / (N + 1)) * np.sin(np.outer(j, n) * np.pi / (N + 1))
-        
+        j = jnp.arange(1, N + 1)
+        n = jnp.arange(1, N + 1)
+        U = jnp.sqrt(2.0 / (N + 1)) * jnp.sin(jnp.outer(j, n) * jnp.pi / (N + 1))
+
         # First derivative matrix in FBR basis
         # D^FBR_{nm} = 4nm / (L(n² - m²)) when n+m is odd, 0 otherwise
-        nn, mm = np.meshgrid(n, n, indexing='ij')
+        nn, mm = jnp.meshgrid(n, n, indexing='ij')
         parity_mask = (nn + mm) % 2 == 1  # True when n+m is odd
-        
+
         # Avoid division by zero on diagonal (n=m) and even-parity entries
-        denom = np.where(parity_mask, nn**2 - mm**2, 1.0)
-        D_FBR = np.where(parity_mask, 4.0 * nn * mm / (L * denom), 0.0)
-        
+        denom = jnp.where(parity_mask, nn**2 - mm**2, 1.0)
+        D_FBR = jnp.where(parity_mask, 4.0 * nn * mm / (L * denom), 0.0)
+
         # Transform to DVR: D_DVR = U @ D_FBR @ U^T
         D = U @ D_FBR @ U.T
-        
+
         return D
     
     def get_position_matrix(self):
@@ -167,7 +167,7 @@ class SineDVR:
         X : ndarray (num_points, num_points)
             Diagonal position matrix with X_{jj} = x_j.
         """
-        return np.diag(self.grid)
+        return jnp.diag(self.grid)
     
     def get_momentum_matrix(self):
         """Get the momentum operator matrix.
@@ -197,7 +197,7 @@ class SineDVR:
             Diagonal potential matrix.
         """
         V_diag = potential(self.grid)
-        return np.diag(V_diag)
+        return jnp.diag(V_diag)
     
     def get_h(self, potential=None, time_dependent_potential=None):
         """Get the single-particle Hamiltonian matrix elements.
@@ -230,7 +230,7 @@ class SineDVR:
         # Return callable for time-dependent case
         def h_of_t(t):
             V_t = time_dependent_potential(self.grid, t)
-            return h_static + np.diag(V_t)
+            return h_static + jnp.diag(V_t)
         
         return h_of_t
     
@@ -252,18 +252,18 @@ class SineDVR:
             2D interaction matrix (diagonal in DVR for each particle).
         """
         # Create meshgrid for all pairs
-        x1, x2 = np.meshgrid(self.grid, self.grid, indexing='ij')
-        
+        x1, x2 = jnp.meshgrid(self.grid, self.grid, indexing='ij')
+
         # Evaluate interaction (try both signatures)
         try:
             g = interaction(x1, x2)
         except TypeError:
             # If interaction takes |r|, compute distance
-            r = np.abs(x1 - x2)
+            r = jnp.abs(x1 - x2)
             g = interaction(r)
-        
+
         return g
-    
+
     def get_g_cross_species(self, other_dvr, interaction):
         """Get 2-body interaction matrix elements between different species.
         
@@ -283,14 +283,14 @@ class SineDVR:
             2D cross-species interaction matrix.
         """
         # Create meshgrid between the two grids
-        x1, x2 = np.meshgrid(self.grid, other_dvr.grid, indexing='ij')
-        
+        x1, x2 = jnp.meshgrid(self.grid, other_dvr.grid, indexing='ij')
+
         try:
             g = interaction(x1, x2)
         except TypeError:
-            r = np.abs(x1 - x2)
+            r = jnp.abs(x1 - x2)
             g = interaction(r)
-        
+
         return g
     
     def get_spf(self):
@@ -487,7 +487,7 @@ def softened_coulomb(kappa=1.0, a=0.1):
         Function V(x1, x2).
     """
     def interaction(x1, x2):
-        return kappa / np.sqrt((x1 - x2) ** 2 + a ** 2)
+        return kappa / jnp.sqrt((x1 - x2) ** 2 + a ** 2)
     return interaction
 
 
@@ -509,8 +509,8 @@ def contact_interaction(g=1.0, sigma=0.1):
         Function V(x1, x2).
     """
     def interaction(x1, x2):
-        norm = 1.0 / (np.sqrt(2 * np.pi) * sigma)
-        return g * norm * np.exp(-0.5 * ((x1 - x2) / sigma) ** 2)
+        norm = 1.0 / (jnp.sqrt(2 * jnp.pi) * sigma)
+        return g * norm * jnp.exp(-0.5 * ((x1 - x2) / sigma) ** 2)
     return interaction
 
 
@@ -581,7 +581,7 @@ def gaussian_barrier(height=1.0, width=1.0, center=0.0):
         Function V(x).
     """
     def potential(x):
-        return height * np.exp(-0.5 * ((x - center) / width) ** 2)
+        return height * jnp.exp(-0.5 * ((x - center) / width) ** 2)
     return potential
 
 
@@ -605,7 +605,7 @@ def time_dependent_displacement(omega_drive, amplitude, base_potential):
         Function V(x, t).
     """
     def potential(x, t):
-        x_shifted = x - amplitude * np.sin(omega_drive * t)
+        x_shifted = x - amplitude * jnp.sin(omega_drive * t)
         return base_potential(x_shifted)
     return potential
 

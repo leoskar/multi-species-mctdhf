@@ -372,21 +372,27 @@ def _sil_solve_C_bidi(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10
 
 
 def _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape):
-    """Exact CI propagator via dense diagonalisation of H_CI.
+    """Exact CI propagator for the linearised CMF substep.
 
-    ITE: replace C by the lowest ``num_states`` eigenvectors of H_CI. The
-    input C is used only as a dtype/shape template — the result is the exact
-    state-averaged MCSCF CI update given the current orbitals (so the dt
-    argument is irrelevant in this branch).
+    ITE: replace C by the lowest ``num_states`` eigenvectors of H_CI via a
+    dense eigendecomposition. The input C is used only as a dtype/shape
+    template — the result is the exact state-averaged MCSCF CI update given
+    the current orbitals (so the dt argument is irrelevant in this branch).
 
-    RTE: form ``exp(-i*dt*H_CI) @ C`` exactly via the eigendecomposition.
+    RTE: form ``expm(-i*dt*H_CI) @ C`` via a dense matrix exponential. This
+    is autodiff-clean: unlike the eigendecomposition route
+    (``U @ diag(exp(-i*dt*λ)) @ U†``), ``expm``'s reverse-mode VJP is built
+    from matmuls and a linear solve — it has no ``1/(λ_i-λ_j)`` terms, so it
+    does not produce NaN gradients when H_CI has degenerate eigenvalues
+    (verified 2026-05-22). Forward value and unitarity match the eigh route
+    to machine precision at the dt·‖H_CI‖ of a typical step, and expm is the
+    faster of the two on GPU for the forward pass.
 
     Cheap when prod(num_dets) is small (≲ a few thousand). For larger CI
     dimensions prefer SIL.
 
     Returns ``(C_new, error)`` to match the ``_sil_solve_C`` signature; the
-    error estimate is identically zero (diagonalisation is exact in floating
-    point).
+    error estimate is identically zero (exact in the linearised substep).
     """
     num_states = c_shape[0]
     det_shape = c_shape[1:]
@@ -400,22 +406,27 @@ def _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape):
     eye = jnp.eye(n_dets_tot, dtype=C.dtype).reshape((n_dets_tot,) + det_shape)
     sigma = mctdh.dCI.get_sigma(eye, h_MO_list, g_MO_dict)
     H_CI = sigma.reshape(n_dets_tot, n_dets_tot)
-    # Hermitise to clean up floating-point noise before eigh.
+    # Hermitise to clean up floating-point noise.
     H_CI = 0.5 * (H_CI + H_CI.conj().T)
-    eigvals, eigvecs = jnp.linalg.eigh(H_CI)  # ascending eigenvalues
 
     if mctdh.imag_time:
         # Lowest num_states eigenvectors as the new state-averaged CI vectors.
         # eigvecs columns -> states; transpose so the leading axis is `state`.
+        _, eigvecs = jnp.linalg.eigh(H_CI)  # ascending eigenvalues
         C_new = eigvecs[:, :num_states].T.reshape(c_shape)
     else:
-        # Exact unitary propagation: U @ diag(exp(-i*dt*λ)) @ U† @ C.
+        # Exact unitary propagation via the matrix exponential. expm keeps
+        # the reverse pass NaN-free at degenerate H_CI eigenvalues; the eigh
+        # route's eigenvector VJP would divide by (λ_i - λ_j). The
+        # contraction `C_flat @ U` reproduces the eigh route's
+        # `C_flat @ V @ diag(exp(-i dt λ)) @ V†` exactly — note NO transpose
+        # on U: H_CI is complex-Hermitian (not symmetric), so `C_flat @ U.T`
+        # would propagate with the conjugated Hamiltonian.
         C_flat = C.reshape(num_states, n_dets_tot)
-        C_eig = C_flat @ eigvecs
-        C_eig = C_eig * jnp.exp(-1j * dt * eigvals)[None, :]
-        C_new = (C_eig @ eigvecs.conj().T).reshape(c_shape)
+        U = jax.scipy.linalg.expm(-1j * dt * H_CI)
+        C_new = (C_flat @ U).reshape(c_shape)
 
-    return C_new, jnp.zeros((), dtype=eigvals.dtype)
+    return C_new, jnp.zeros((), dtype=H_CI.real.dtype)
 
 
 def _sil_solve_bs(
@@ -519,8 +530,15 @@ def _diag_solve_bs(
     P_frozens,
     dt,
     b_shapes,
+    compute_x64=False,
 ):
     """Exact orbital propagator via dense matrix exponential of A_s.
+
+    When ``compute_x64`` is set, the dense A_s build (the basis-vector
+    matvecs) stays in the native bulk dtype, but the precision-critical step
+    — the non-Hermitian matrix exponential and its application to b — is
+    promoted to complex128, then cast back. This stabilises float32 CMF runs
+    without paying complex128 cost throughout the build.
 
     For each species s, builds A_s as a dense (N_s, N_s) matrix where
     N_s = n_spatial_s * M_s by applying _rhs_b_linear to the standard
@@ -544,6 +562,8 @@ def _diag_solve_bs(
     """
     bs_new = list(bs_start)
     err_dtype = bs_start[0].real.dtype
+    out_dtype = bs_start[0].dtype
+
     for s in range(mctdh.num_species):
         b_s = bs_start[s]
         b_flat = b_s.reshape(-1)
@@ -556,20 +576,28 @@ def _diag_solve_bs(
             return rhs.reshape(-1)
 
         # Build dense linear operator by vmapping apply_once over standard
-        # basis vectors of the flat (n_spatial · M) orbital space.
+        # basis vectors of the flat (n_spatial · M) orbital space. This stays
+        # in the native bulk dtype even when compute_x64 is set.
         I_cols = jnp.eye(N_s, dtype=b_s.dtype).reshape((N_s,) + b_shapes[s])
         J_rows = jax.vmap(apply_once)(I_cols)   # row k = J · e_k
         J_mat = J_rows.T                         # columns = J · e_k → J as matrix
 
-        # Extract A_s from _rhs_b_linear sign convention.
+        # Extract A_s from _rhs_b_linear sign convention; form the expm argument.
         if mctdh.imag_time:
-            A_s = -J_mat
-            expA = jax.scipy.linalg.expm(-dt * A_s)
+            arg = -dt * (-J_mat)
         else:
-            A_s = 1j * J_mat
-            expA = jax.scipy.linalg.expm(-1j * dt * A_s)
+            arg = -1j * dt * (1j * J_mat)
 
-        bs_new[s] = (expA @ b_flat).reshape(b_shapes[s])
+        # The non-Hermitian expm is the precision-critical step: optionally
+        # promote just it (and the application to b) to complex128.
+        if compute_x64:
+            expA = jax.scipy.linalg.expm(arg.astype(jnp.complex128))
+            b_new_flat = expA @ b_flat.astype(jnp.complex128)
+        else:
+            expA = jax.scipy.linalg.expm(arg)
+            b_new_flat = expA @ b_flat
+
+        bs_new[s] = b_new_flat.reshape(b_shapes[s]).astype(out_dtype)
 
     return bs_new, jnp.zeros((), dtype=err_dtype)
 
@@ -694,7 +722,7 @@ _B_KWARG_KEYS_HALF = {
     "cn": ("solver_tol", "max_solver_iter", "n_orbital_substeps"),
     "sil": ("krylov_dim",),
     "bs": ("bs_sequence",),
-    "diagonalize": (),
+    "diagonalize": ("orbital_x64",),
 }
 
 
@@ -935,6 +963,7 @@ def get_cmf_half_step_integrator(
     b_krylov_dim = b_kwargs.get("krylov_dim", 20)
     n_sub = b_kwargs.get("n_orbital_substeps", 1)
     bs_sequence = b_kwargs.get("bs_sequence", (2, 4, 6, 8, 12, 16))
+    b_orbital_x64 = b_kwargs.get("orbital_x64", False)
 
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
     b_shapes = [
@@ -1021,6 +1050,7 @@ def get_cmf_half_step_integrator(
                 P_frozens_t,
                 dt_half,
                 b_shapes,
+                compute_x64=b_orbital_x64,
             )
         else:
             dt_orb_pred = dt_half / n_sub
@@ -1086,6 +1116,7 @@ def get_cmf_half_step_integrator(
                 P_frozens_half,
                 dt,
                 b_shapes,
+                compute_x64=b_orbital_x64,
             )
         else:
             dt_orb_corr = dt / n_sub

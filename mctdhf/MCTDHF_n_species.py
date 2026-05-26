@@ -100,6 +100,7 @@ class MCTDHF_n_species:
         imag_time=False,
         eps=1e-6,
         state_weights=None,
+        e_shift=0.0,
     ):
         err_msg = "Input lists must have the same length (number of species)."
         np.testing.assert_equal(len(num_particles), len(num_mctdhf_orbitals), err_msg)
@@ -133,6 +134,16 @@ class MCTDHF_n_species:
                 )
         self.state_weights = w / jnp.sum(w)
 
+        # Constant Hamiltonian energy shift: the solver works with H - e_shift,
+        # realized purely as a per-species constant on the one-body integrals
+        # (see _get_h_current). This only multiplies the wavefunction by a
+        # global phase exp(+i*e_shift*t), so observables and the orbital EOM
+        # are unchanged; calculate_energy adds e_shift back. Used to keep the
+        # working energy scale near zero for float32 numerical stability.
+        # Default 0.0 is a no-op. Set before the first propagation call:
+        # changing it triggers a JAX recompile.
+        self.e_shift = float(e_shift)
+
     # ── State vector packing / unpacking ──────────────────────────────────
 
     def _Cb_to_y(self, C, bs_list):
@@ -152,6 +163,16 @@ class MCTDHF_n_species:
         return contract("s,s...->...", self.state_weights, tensor, backend="jax")
 
     # ── Integral helpers ──────────────────────────────────────────────────
+
+    def _h_shift_constant(self):
+        """Constant c added to the MO integral h_2 inside transform_h to shift
+        the Hamiltonian by -e_shift.
+
+        The 1-body operator built from c*I_MO is c times the number operator
+        (= c*N_s per species), so a uniform c = -e_shift / N_total satisfies
+        sum_s c*N_s = -e_shift. The same c is used for every species.
+        """
+        return -self.e_shift / sum(self.num_particles)
 
     def _get_h_current(self, t):
         """Evaluate 1-body integrals at time t (handles callable and static h)."""
@@ -211,10 +232,21 @@ class MCTDHF_n_species:
             Fully transformed ⟨n|h|m⟩ (MO × MO).
         h_3 : jnp.ndarray
             Projected ⟨i|P h P|m⟩ (spatial × MO).
+
+        Applies the constant energy shift (H - e_shift): a c*I term is added to
+        the fully transformed MO integral h_2 (and only h_2), so the CI RHS,
+        get_sigma, H_CI and calculate_energy all work near zero energy. Adding
+        c times the MO-space identity is exact regardless of orbital
+        orthonormality — unlike shifting the spatial h, where c*b†b leaks a
+        non-constant term when b drifts off orthonormality. h_1 and h_3 are
+        left unshifted, so the orbital equations of motion are unaffected.
         """
         h_1 = contract("jm, ij -> im", b, h, backend="jax")
         h_2 = contract("in, im -> nm", b.conj(), h_1, backend="jax")
         h_3 = contract("in, nm -> im", b, h_2, backend="jax")
+        c = self._h_shift_constant()
+        if c != 0.0:
+            h_2 = h_2 + c * jnp.eye(h_2.shape[0], dtype=h_2.dtype)
         return h_1, h_2, h_3
 
     @partial(jit, static_argnums=0)
@@ -261,7 +293,12 @@ class MCTDHF_n_species:
 
     @partial(jit, static_argnums=0)
     def calculate_energy(self, t, y):
-        """Calculate total energy at time t."""
+        """Calculate total energy at time t.
+
+        Uses E = ⟨C | σ⟩ with σ = H|C⟩ from get_sigma, reusing the same
+        contraction path as the RHS — avoids RDM construction and its
+        num_species² distinct einsum signatures.
+        """
         C, bs = self._y_to_Cb(y)
 
         h_current = self._get_h_current(t)
@@ -270,7 +307,26 @@ class MCTDHF_n_species:
         ]
         g_MO_dict, _ = self._transform_all_g(bs, full=False)
 
-        return self.dCI.calculate_energy(C, h_MO_list, g_MO_dict)
+        sigma = self.dCI.get_sigma(C, h_MO_list, g_MO_dict)
+        det_axes = tuple(range(1, C.ndim))
+        # h_current is shifted by -e_shift, so sigma corresponds to H - e_shift;
+        # add e_shift back to report the physical energy (per state).
+        return jnp.sum(C.conj() * sigma, axis=det_axes) + self.e_shift
+
+    def suggest_e_shift(self, t, y):
+        """Return a good e_shift: the mean unshifted total energy over states.
+
+        Usage: ``mctdh.e_shift = mctdh.suggest_e_shift(t0, y0)``. For SA-MCTDHF
+        this averages the per-state energies, so a single global shift centers
+        the whole bundle near zero.
+        """
+        old = self.e_shift
+        self.e_shift = 0.0
+        try:
+            E = self.calculate_energy(t, y)
+        finally:
+            self.e_shift = old
+        return float(jnp.real(jnp.mean(E)))
 
     # ── Equations of motion ───────────────────────────────────────────────
 

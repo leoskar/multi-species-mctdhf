@@ -158,6 +158,9 @@ def _make_cmf_step(mctdh, dt, sil_b_krylov_dim):
     def step(t, y, h_list):
         C, bs = mctdh._y_to_Cb(y)
 
+        # transform_h applies the constant energy shift (H - e_shift) to the
+        # MO integrals; the orbital sub-problem below uses the spatial h_list
+        # directly and stays unshifted, keeping the shift an exact phase.
         h_MO_list = [
             mctdh.transform_h(h_list[s], bs[s])[1]
             for s in range(mctdh.num_species)
@@ -206,6 +209,7 @@ class MCTDHF_n_species_ITE_opt:
         num_states,
         state_weights=None,
         eps=1e-6,
+        e_shift=0.0,
     ):
         err = "Input lists must have the same length (number of species)."
         np.testing.assert_equal(len(num_particles), len(num_mctdhf_orbitals), err)
@@ -231,6 +235,12 @@ class MCTDHF_n_species_ITE_opt:
                     f"state_weights must have shape ({num_states},), got {w.shape}"
                 )
         self.state_weights = w / jnp.sum(w)
+
+        # Constant Hamiltonian energy shift (H - e_shift), realized as a
+        # per-species c*I term on the 1-body integrals. Pure global phase;
+        # observables unchanged, calculate_energy adds it back. Default 0.0
+        # is a no-op. See MCTDHF_n_species for details.
+        self.e_shift = float(e_shift)
 
         # Caches keyed by (dt, save_every, sil_b_krylov_dim) and (dt, sil_b_krylov_dim).
         self._step_cache = {}
@@ -258,14 +268,28 @@ class MCTDHF_n_species_ITE_opt:
     def _state_average(self, tensor):
         return contract("s,s...->...", self.state_weights, tensor, backend="jax")
 
+    def _h_shift_constant(self):
+        """Uniform per-particle constant c = -e_shift / N_total added to the MO
+        integral h_2 inside transform_h, shifting the total Hamiltonian by
+        -e_shift (sum_s c*N_s = -e_shift)."""
+        return -self.e_shift / sum(self.num_particles)
+
     # ── Integral transforms (DVR g) ───────────────────────────────────────
 
     @partial(jit, static_argnums=0)
     def transform_h(self, h, b):
-        """1-body integral transform (basis is irrelevant — h is always 2-D)."""
+        """1-body integral transform (basis is irrelevant — h is always 2-D).
+
+        Applies the constant energy shift (H - e_shift) by adding c*I_MO to the
+        fully transformed h_2 only. This is exact regardless of orbital
+        orthonormality; h_1/h_3 and the orbital sub-problem stay unshifted.
+        """
         h_1 = contract("jm, ij -> im", b, h, backend="jax")
         h_2 = contract("in, im -> nm", b.conj(), h_1, backend="jax")
         h_3 = contract("in, nm -> im", b, h_2, backend="jax")
+        c = self._h_shift_constant()
+        if c != 0.0:
+            h_2 = h_2 + c * jnp.eye(h_2.shape[0], dtype=h_2.dtype)
         return h_1, h_2, h_3
 
     @partial(jit, static_argnums=0)
@@ -345,7 +369,8 @@ class MCTDHF_n_species_ITE_opt:
             for s in range(self.num_species)
         ]
         g_MO_dict, _ = self._transform_all_g(bs)
-        return self.dCI.calculate_energy(C, h_MO_list, g_MO_dict)
+        # transform_h shifts the MO integrals by -e_shift; add it back here.
+        return self.dCI.calculate_energy(C, h_MO_list, g_MO_dict) + self.e_shift
 
     # ── Orthonormalisation (always applied for ITE) ───────────────────────
 
