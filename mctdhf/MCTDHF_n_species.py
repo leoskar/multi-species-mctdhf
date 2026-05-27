@@ -87,6 +87,12 @@ class MCTDHF_n_species:
         If True, propagate in imaginary time (for ground-state search).
     eps : float
         Tikhonov regularization parameter for the density matrix inversion.
+    e_shift : float or "auto"
+        Constant energy shift; the solver propagates H - e_shift (a global
+        phase only). Use to center the working energy near zero for float32
+        stability. Pass "auto" to have integrate() / integrate_adaptive()
+        set it to suggest_e_shift(t_init, y_init) automatically before the
+        first step. Default 0.0 (no shift).
     """
 
     def __init__(
@@ -140,9 +146,21 @@ class MCTDHF_n_species:
         # global phase exp(+i*e_shift*t), so observables and the orbital EOM
         # are unchanged; calculate_energy adds e_shift back. Used to keep the
         # working energy scale near zero for float32 numerical stability.
-        # Default 0.0 is a no-op. Set before the first propagation call:
-        # changing it triggers a JAX recompile.
-        self.e_shift = float(e_shift)
+        # Default 0.0 is a no-op. Pass "auto" to have integrate() /
+        # integrate_adaptive() set it to suggest_e_shift(t_init, y_init) before
+        # the first propagation step. Set this before any JIT-compiled method
+        # of the instance runs: e_shift is read as a Python attribute inside
+        # JIT'd methods and baked into the trace, so mutating it later does
+        # NOT invalidate the cache (static_argnums=0 with default id-based
+        # __hash__ — same self, same cache key).
+        if isinstance(e_shift, str):
+            if e_shift != "auto":
+                raise ValueError(
+                    f"e_shift must be a number or 'auto', got {e_shift!r}"
+                )
+            self.e_shift = "auto"
+        else:
+            self.e_shift = float(e_shift)
 
     # ── State vector packing / unpacking ──────────────────────────────────
 
@@ -172,7 +190,18 @@ class MCTDHF_n_species:
         (= c*N_s per species), so a uniform c = -e_shift / N_total satisfies
         sum_s c*N_s = -e_shift. The same c is used for every species.
         """
+        if self.e_shift == "auto":
+            raise RuntimeError(
+                "e_shift is 'auto' but has not been resolved. Call "
+                "integrate() / integrate_adaptive(), or set it manually via "
+                "`mctdh.e_shift = mctdh.suggest_e_shift(t0, y0)`."
+            )
         return -self.e_shift / sum(self.num_particles)
+
+    def _resolve_auto_e_shift(self, t, y):
+        """If e_shift is 'auto', replace it with suggest_e_shift(t, y)."""
+        if self.e_shift == "auto":
+            self.e_shift = self.suggest_e_shift(t, y)
 
     def _get_h_current(self, t):
         """Evaluate 1-body integrals at time t (handles callable and static h)."""
@@ -319,13 +348,29 @@ class MCTDHF_n_species:
         Usage: ``mctdh.e_shift = mctdh.suggest_e_shift(t0, y0)``. For SA-MCTDHF
         this averages the per-state energies, so a single global shift centers
         the whole bundle near zero.
+
+        Inlines the (unshifted) 1-body MO transform instead of routing through
+        ``self.transform_h``: the latter is @jit'd and Python-branches on
+        whether the shift constant is zero, so tracing it with a temporary
+        ``e_shift = 0`` would cache a no-shift version of ``transform_h`` and
+        every later energy/EOM call would silently reuse it.
+        ``self.transform_g`` and ``self.dCI.get_sigma`` do not depend on
+        ``e_shift``, so calling them here is safe.
         """
-        old = self.e_shift
-        self.e_shift = 0.0
-        try:
-            E = self.calculate_energy(t, y)
-        finally:
-            self.e_shift = old
+        C, bs = self._y_to_Cb(y)
+        h_current = self._get_h_current(t)
+
+        h_MO_list = []
+        for s in range(self.num_species):
+            b = bs[s]
+            h_1 = contract("jm, ij -> im", b, h_current[s], backend="jax")
+            h_2 = contract("in, im -> nm", b.conj(), h_1, backend="jax")
+            h_MO_list.append(h_2)
+
+        g_MO_dict, _ = self._transform_all_g(bs, full=False)
+        sigma = self.dCI.get_sigma(C, h_MO_list, g_MO_dict)
+        det_axes = tuple(range(1, C.ndim))
+        E = jnp.sum(C.conj() * sigma, axis=det_axes)
         return float(jnp.real(jnp.mean(E)))
 
     # ── Equations of motion ───────────────────────────────────────────────
@@ -830,6 +875,7 @@ class MCTDHF_n_species:
             ]
 
         y_init = self._Cb_to_y(C_init, bs_init_list)
+        self._resolve_auto_e_shift(t_init, y_init)
         t = t_init
         y = y_init
 
@@ -1014,6 +1060,7 @@ class MCTDHF_n_species:
             ]
 
         y_init = self._Cb_to_y(C_init, bs_init_list)
+        self._resolve_auto_e_shift(t_init, y_init)
 
         # Normalization mode
         if normalize is True or (normalize is None and self.imag_time):
