@@ -63,6 +63,55 @@ def unpack_y_to_Cb(
     return C, bs_list
 
 
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _regularized_inverse(eps, D):
+    """Tikhonov-regularized inverse (D + εI)⁻¹ of a Hermitian PSD matrix.
+
+    D + εI is Hermitian positive definite (the 1-RDM is PSD up to roundoff,
+    and the complex128 promotion keeps that roundoff far below ε), so a
+    Cholesky solve returns exactly the same inverse the previous
+    eigendecomposition-based implementation did, at a fraction of the flops.
+
+    Differentiation is the decisive difference: eigh's JVP carries
+    1/(λ_i - λ_j) factors that blow up for the near-degenerate small natural
+    occupations of weakly occupied orbitals, poisoning Newton–Krylov tangents
+    (VMF) in low precision. Cholesky's autodiff JVP is smooth but built from
+    many small triangular solves, which is slow on CPU for these tiny
+    matrices — so the JVP is overridden with the exact analytic rule
+    d(A⁻¹) = -A⁻¹·dA·A⁻¹ (two small matmuls, smooth everywhere).
+
+    If D ever has an eigenvalue below -ε (a badly broken density matrix),
+    Cholesky yields NaN where eigh returned a large finite garbage inverse —
+    a louder, preferable failure.
+    """
+    # Increased precision for the factorization
+    D_64 = D.astype(jnp.complex128)
+    A = D_64 + eps * jnp.eye(D.shape[-1], dtype=jnp.complex128)
+    A = 0.5 * (A + A.conj().T)  # re-Hermitize accumulated roundoff
+    L = jnp.linalg.cholesky(A)
+    eye = jnp.eye(D.shape[-1], dtype=jnp.complex128)
+    D_inv_64 = jax.scipy.linalg.cho_solve((L, True), eye)
+    # Cast back to the working dtype (previously hard-coded complex64,
+    # which silently truncated D⁻¹ in all-x64 runs).
+    return D_inv_64.astype(D.dtype)
+
+
+@_regularized_inverse.defjvp
+def _regularized_inverse_jvp(eps, primals, tangents):
+    """Exact differential of D ↦ ((D + D†)/2 + εI)⁻¹.
+
+    The tangent dD is Hermitized to match the symmetrization in the primal;
+    for the Hermitian tangents produced by RDM differentiation this is a
+    no-op up to roundoff.
+    """
+    (D,) = primals
+    (dD,) = tangents
+    inv = _regularized_inverse(eps, D)
+    dA = 0.5 * (dD + dD.conj().T)
+    d_inv = -inv @ dA @ inv
+    return inv, d_inv
+
+
 class MCTDHF_n_species:
     """MCTDHF solver for N distinguishable species.
 
@@ -451,12 +500,17 @@ class MCTDHF_n_species:
         sigma = self.dCI.get_sigma(C, h_MO_list, g_MO_dict)
         return -sigma if self.imag_time else -1j * sigma
 
-    def _rhs_b_linear(self, b_s, s, h_current_s, D_inv, ds, bs_frozen, P_frozen):
+    def _rhs_b_linear(self, b_s, s, h_current_s, D_inv, ds, bs_frozen):
         """Orbital RHS with frozen projector and density matrices (linear in b_s).
 
         Used by the CMF integrator for the decoupled orbital propagation.
         The projector P and density matrices are frozen at their values from
         the beginning of the time step, making this linear in b_s.
+
+        The frozen projector P = b_f·b_f† is never materialized: it is
+        applied in factored form as b_f·(b_f†·X), which costs O(N·M) per
+        column instead of O(N²) — the dense form's O(N²M³) application to
+        the mean-field tensor dominated the whole orbital RHS.
 
         Parameters
         ----------
@@ -471,18 +525,19 @@ class MCTDHF_n_species:
         ds : dict
             State-averaged 2-RDMs {(s1, s2): d_pqrs}.
         bs_frozen : list of jnp.ndarray
-            Orbital matrices for all species (frozen at step start).
-        P_frozen : jnp.ndarray
-            Frozen projector P = b·b† for species s.
+            Orbital matrices for all species (frozen at step start);
+            bs_frozen[s] defines the frozen projector for species s.
 
         Returns
         -------
         b_dot : jnp.ndarray
             Time derivative of b_s, same shape as b_s.
         """
-        # 1-body: (1-P)h contribution
+        b_f = bs_frozen[s]
+
+        # 1-body: (1-P)h contribution, P applied in factored form
         h_1 = contract("ij, jm -> im", h_current_s, b_s, backend="jax")
-        h_3 = P_frozen @ h_1
+        h_3 = b_f @ (b_f.conj().T @ h_1)
         b_dot = h_1 - h_3
 
         # 2-body: mean-field contribution with frozen tau orbitals and P
@@ -496,7 +551,8 @@ class MCTDHF_n_species:
 
             # Transform g with b_s (varies) and bs_frozen[k] (fixed)
             g_3, g_4, _ = self.transform_g(g_spatial, b_s, bs_frozen[k])
-            g_5 = contract("ij, jqrs -> iqrs", P_frozen, g_3, backend="jax")
+            g_proj = contract("jn, jqrs -> nqrs", b_f.conj(), g_3, backend="jax")
+            g_5 = contract("jn, nqrs -> jqrs", b_f, g_proj, backend="jax")
 
             d_sk = ds[(s, k)]
             b_dot = b_dot + contract(
@@ -507,13 +563,12 @@ class MCTDHF_n_species:
 
     @partial(jit, static_argnums=0)
     def _invert_density_matrix(self, D):
-        """Regularized inverse of density matrix."""
-        # Increased precision for the inversion
-        D_64 = D.astype(jnp.complex128)
-        eigvals_64, eigvecs_64 = jnp.linalg.eigh(D_64)
-        # Tikhonov regularization: (D + εI)⁻¹ for smooth handling of singular density matrices
-        D_inv_64 = (eigvecs_64 / (eigvals_64 + self.eps)) @ eigvecs_64.conj().T
-        return D_inv_64.astype(jnp.complex64)
+        """Regularized inverse (D + εI)⁻¹ of the density matrix.
+
+        Delegates to :func:`_regularized_inverse` (Cholesky solve with an
+        exact analytic JVP). See that function for the numerical rationale.
+        """
+        return _regularized_inverse(self.eps, D)
 
     # ── PSI (Projector-Splitting Integrator) helpers ──────────────────────
 
@@ -673,8 +728,8 @@ class MCTDHF_n_species:
         b_dots = []
         for s in range(self.num_species):
             h_1 = h_current[s] @ bs[s]
-            P = bs[s] @ bs[s].conj().T
-            h_3 = P @ h_1
+            # Projector applied in factored form (never materialize b·b†)
+            h_3 = bs[s] @ (bs[s].conj().T @ h_1)
             b_dot = -(h_1 - h_3) if self.imag_time else -1j * (h_1 - h_3)
             b_dots.append(b_dot)
 

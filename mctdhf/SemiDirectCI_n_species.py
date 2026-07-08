@@ -349,38 +349,42 @@ class SemiDirectCI_n_species:
         """
         ds = {}
 
+        # Intra-species: reuse shared rho_ci helper
         for s1 in range(self.num_species):
-            for s2 in range(self.num_species):
-                if s1 == s2:
-                    # Intra-species: reuse shared rho_ci helper
-                    rho_ci = self._compute_rho_ci(C, s1)
-                    d_intra = contract(
-                        "ijpqrs, ...ij -> ...pqrs",
-                        self.E_pqrs[s1],
-                        rho_ci,
-                        backend="jax",
-                    )
-                    ds[(s1, s1)] = d_intra
-                else:
-                    # Inter-species: contract over all indices except s1 and s2
-                    idx_conj = [chr(97 + i) for i in range(self.num_species)]
-                    idx_norm = [chr(97 + i) for i in range(self.num_species)]
-                    idx_conj[s1], idx_conj[s2] = "x", "z"
-                    idx_norm[s1], idx_norm[s2] = "y", "w"
+            rho_ci = self._compute_rho_ci(C, s1)
+            ds[(s1, s1)] = contract(
+                "ijpqrs, ...ij -> ...pqrs",
+                self.E_pqrs[s1],
+                rho_ci,
+                backend="jax",
+            )
 
-                    rho_pair_str = (
-                        f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
-                    )
-                    rho_pair = contract(rho_pair_str, C.conj(), C, backend="jax")
+        # Inter-species: compute s1 < s2 only. Excitation operators of
+        # different species commute, so the reversed pair is a pure index
+        # permutation: d^(s2,s1)_{pqrs} = ⟨E^(s2)_{pr} E^(s1)_{qs}⟩
+        #                              = d^(s1,s2)_{qpsr}.
+        for s1 in range(self.num_species):
+            for s2 in range(s1 + 1, self.num_species):
+                # Contract over all indices except s1 and s2
+                idx_conj = [chr(97 + i) for i in range(self.num_species)]
+                idx_norm = [chr(97 + i) for i in range(self.num_species)]
+                idx_conj[s1], idx_conj[s2] = "x", "z"
+                idx_norm[s1], idx_norm[s2] = "y", "w"
 
-                    d_inter = contract(
-                        "...xzyw, xypr, zwqs -> ...pqrs",
-                        rho_pair,
-                        self.E_pq[s1],
-                        self.E_pq[s2],
-                        backend="jax",
-                    )
-                    ds[(s1, s2)] = d_inter
+                rho_pair_str = (
+                    f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
+                )
+                rho_pair = contract(rho_pair_str, C.conj(), C, backend="jax")
+
+                d_inter = contract(
+                    "...xzyw, xypr, zwqs -> ...pqrs",
+                    rho_pair,
+                    self.E_pq[s1],
+                    self.E_pq[s2],
+                    backend="jax",
+                )
+                ds[(s1, s2)] = d_inter
+                ds[(s2, s1)] = jnp.einsum("...pqrs->...qpsr", d_inter)
 
         return ds
 
