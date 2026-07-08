@@ -175,7 +175,6 @@ def _cn_solve_bs(
     D_invs,
     ds,
     bs_frozen,
-    P_frozens,
     dt_sub,
     b_shapes,
     solver_tol,
@@ -190,14 +189,14 @@ def _cn_solve_bs(
         b_s = bs_start[s]
 
         b_dot_0 = mctdh._rhs_b_linear(
-            b_s, s, h_current[s], D_invs[s], ds, bs_frozen, P_frozens[s]
+            b_s, s, h_current[s], D_invs[s], ds, bs_frozen
         )
         b_vec = b_s + (dt_sub / 2) * b_dot_0
 
         def matvec(x_flat, _s=s):
             x = x_flat.reshape(b_shapes[_s])
             fx = mctdh._rhs_b_linear(
-                x, _s, h_current[_s], D_invs[_s], ds, bs_frozen, P_frozens[_s]
+                x, _s, h_current[_s], D_invs[_s], ds, bs_frozen
             )
             return (x - (dt_sub / 2) * fx).reshape(-1)
 
@@ -436,7 +435,6 @@ def _sil_solve_bs(
     D_invs,
     ds,
     bs_frozen,
-    P_frozens,
     dt,
     b_shapes,
     krylov_dim=20,
@@ -464,7 +462,7 @@ def _sil_solve_bs(
             """Apply orbital Hamiltonian A such that db/dt = -iAb (RTE)."""
             b = v_flat.reshape(b_shapes[_s])
             rhs = mctdh._rhs_b_linear(
-                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, P_frozens[_s]
+                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen
             )
             # _rhs_b_linear returns -1j*A*b (RTE) or -A*b (ITE)
             # We need A*b for the Lanczos (Hermitian operator)
@@ -527,7 +525,6 @@ def _diag_solve_bs(
     D_invs,
     ds,
     bs_frozen,
-    P_frozens,
     dt,
     b_shapes,
     compute_x64=False,
@@ -571,7 +568,7 @@ def _diag_solve_bs(
 
         def apply_once(b, _s=s):
             rhs = mctdh._rhs_b_linear(
-                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, P_frozens[_s]
+                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen
             )
             return rhs.reshape(-1)
 
@@ -631,7 +628,6 @@ def _bs_solve_bs(
     D_invs,
     ds,
     bs_frozen,
-    P_frozens,
     dt,
     b_shapes,
     bs_sequence=(2, 4, 6, 8, 12, 16),
@@ -650,7 +646,7 @@ def _bs_solve_bs(
 
         def rhs_b(b, _s=s):
             return mctdh._rhs_b_linear(
-                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, P_frozens[_s]
+                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen
             )
 
         # Compute modified midpoint approximations for each n in sequence
@@ -837,9 +833,8 @@ def get_cmf_integrator(
 
         # 3. Update density matrices from new C
         D_invs, ds = _compute_density_quantities(mctdh, C_new)
-        P_frozens = [bs[s] @ bs[s].conj().T for s in range(mctdh.num_species)]
 
-        # 4. Solve orbitals per species
+        # 4. Solve orbitals per species (frozen projector taken from bs)
         if b_propagator == "sil":
             bs_new, _ = _sil_solve_bs(
                 mctdh,
@@ -848,7 +843,6 @@ def get_cmf_integrator(
                 D_invs,
                 ds,
                 bs,
-                P_frozens,
                 dt,
                 b_shapes,
                 b_krylov_dim,
@@ -861,7 +855,6 @@ def get_cmf_integrator(
                 D_invs,
                 ds,
                 bs,
-                P_frozens,
                 dt,
                 b_shapes,
             )
@@ -873,7 +866,6 @@ def get_cmf_integrator(
                 D_invs,
                 ds,
                 bs,
-                P_frozens,
                 dt,
                 b_shapes,
                 b_solver_tol,
@@ -1010,9 +1002,8 @@ def get_cmf_half_step_integrator(
 
         # Density matrices from C(t)
         D_invs_t, ds_t = _compute_density_quantities(mctdh, C)
-        P_frozens_t = [bs[s] @ bs[s].conj().T for s in range(mctdh.num_species)]
 
-        # Orbital half-step: b(t) → b(t+dt/2)
+        # Orbital half-step: b(t) → b(t+dt/2) (frozen projector from bs)
         if b_propagator == "sil":
             bs_half, _ = _sil_solve_bs(
                 mctdh,
@@ -1021,7 +1012,6 @@ def get_cmf_half_step_integrator(
                 D_invs_t,
                 ds_t,
                 bs,
-                P_frozens_t,
                 dt_half,
                 b_shapes,
                 b_krylov_dim,
@@ -1034,7 +1024,6 @@ def get_cmf_half_step_integrator(
                 D_invs_t,
                 ds_t,
                 bs,
-                P_frozens_t,
                 dt_half,
                 b_shapes,
                 bs_sequence,
@@ -1047,7 +1036,6 @@ def get_cmf_half_step_integrator(
                 D_invs_t,
                 ds_t,
                 bs,
-                P_frozens_t,
                 dt_half,
                 b_shapes,
                 compute_x64=b_orbital_x64,
@@ -1063,7 +1051,6 @@ def get_cmf_half_step_integrator(
                     D_invs_t,
                     ds_t,
                     bs,
-                    P_frozens_t,
                     dt_orb_pred,
                     b_shapes,
                     b_solver_tol,
@@ -1071,14 +1058,12 @@ def get_cmf_half_step_integrator(
                 )
 
         # ── Corrector: full step with midpoint mean fields ──────────────
-        
+
         # Density matrices from C(t+dt/2)
         D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
-        P_frozens_half = [
-            bs_half[s] @ bs_half[s].conj().T for s in range(mctdh.num_species)
-        ]
 
         # Orbital full step: b(t) → b(t+dt) using midpoint mean fields
+        # (frozen projector from bs_half)
         if b_propagator == "sil":
             bs_new, _ = _sil_solve_bs(
                 mctdh,
@@ -1087,7 +1072,6 @@ def get_cmf_half_step_integrator(
                 D_invs_half,
                 ds_half,
                 bs_half,
-                P_frozens_half,
                 dt,
                 b_shapes,
                 b_krylov_dim,
@@ -1100,7 +1084,6 @@ def get_cmf_half_step_integrator(
                 D_invs_half,
                 ds_half,
                 bs_half,
-                P_frozens_half,
                 dt,
                 b_shapes,
                 bs_sequence,
@@ -1113,7 +1096,6 @@ def get_cmf_half_step_integrator(
                 D_invs_half,
                 ds_half,
                 bs_half,
-                P_frozens_half,
                 dt,
                 b_shapes,
                 compute_x64=b_orbital_x64,
@@ -1129,7 +1111,6 @@ def get_cmf_half_step_integrator(
                     D_invs_half,
                     ds_half,
                     bs_half,
-                    P_frozens_half,
                     dt_orb_corr,
                     b_shapes,
                     b_solver_tol,
@@ -1237,9 +1218,8 @@ def get_adaptive_cmf_half_step_integrator(
 
         # Density matrices from C(t)
         D_invs_t0, ds_t0 = _compute_density_quantities(mctdh, C)
-        P_frozens_t0 = [bs[s] @ bs[s].conj().T for s in range(mctdh.num_species)]
 
-        # Orbital half-step: b(t) → b(t+dt/2)
+        # Orbital half-step: b(t) → b(t+dt/2) (frozen projector from bs)
         bs_half, _ = _sil_solve_bs(
             mctdh,
             bs,
@@ -1247,7 +1227,6 @@ def get_adaptive_cmf_half_step_integrator(
             D_invs_t0,
             ds_t0,
             bs,
-            P_frozens_t0,
             dt_half,
             b_shapes,
             sil_b_krylov_dim,
@@ -1256,11 +1235,9 @@ def get_adaptive_cmf_half_step_integrator(
         # ── Corrector: full step with midpoint mean fields ──────────────
         # Density matrices from C(t+dt/2)
         D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
-        P_frozens_half = [
-            bs_half[s] @ bs_half[s].conj().T for s in range(mctdh.num_species)
-        ]
 
         # Orbital full step: b(t) → b(t+dt) using midpoint mean fields
+        # (frozen projector from bs_half)
         bs_t1, err_sil_b = _sil_solve_bs(
             mctdh,
             bs,
@@ -1268,7 +1245,6 @@ def get_adaptive_cmf_half_step_integrator(
             D_invs_half,
             ds_half,
             bs_half,
-            P_frozens_half,
             dt,
             b_shapes,
             sil_b_krylov_dim,
