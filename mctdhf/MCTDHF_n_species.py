@@ -169,6 +169,17 @@ class MCTDHF_n_species:
 
         self.h_is_callable = [callable(h) for h in h_list]
         self.h_list = h_list
+        # Enforce a single ordering per inter-species pair: with both
+        # orderings supplied, every transform/contraction would be done
+        # twice (0.5-weighted) for the identical result — and inconsistent
+        # tensors would be silently averaged.
+        for (s1, s2) in g_dict:
+            if s1 != s2 and (s2, s1) in g_dict:
+                raise ValueError(
+                    f"g_dict contains both ({s1},{s2}) and ({s2},{s1}). "
+                    "Supply only one ordering per species pair; the "
+                    "transpose is applied automatically."
+                )
         self.g_dict = g_dict
 
         self.dCI = SemiDirectCI_n_species(num_mctdhf_orbitals, num_particles)
@@ -327,6 +338,19 @@ class MCTDHF_n_species:
             h_2 = h_2 + c * jnp.eye(h_2.shape[0], dtype=h_2.dtype)
         return h_1, h_2, h_3
 
+    def _transform_g_tau(self, g, b_tau):
+        """Tau half of the 2-body transform: g_{ijkl} → g_{iqks}.
+
+        Depends only on the tau (partner) orbitals and the static spatial
+        integrals — inside a CMF substep the partner orbitals are frozen,
+        so this half is loop-invariant (see _precompute_frozen_g2).
+        """
+        return contract("jq, ls, ijkl -> iqks", b_tau.conj(), b_tau, g, backend="jax")
+
+    def _transform_g_sigma(self, g_2, b_sigma):
+        """Sigma half of the 2-body transform: g_{iqks} → g_{iqrs} (mean field W)."""
+        return contract("kr, iqks -> iqrs", b_sigma, g_2, backend="jax")
+
     @partial(jit, static_argnums=0)
     def transform_g(self, g, b_sigma, b_tau):
         """Transform 2-body integrals ⟨σ τ|V|σ τ⟩ to the MO basis.
@@ -350,14 +374,37 @@ class MCTDHF_n_species:
             Projected mean-field ⟨i|P W P|m⟩.
         """
         # Transform tau indices: g_{ijkl} → g_{iqks}
-        g_2 = contract("jq, ls, ijkl -> iqks", b_tau.conj(), b_tau, g, backend="jax")
+        g_2 = self._transform_g_tau(g, b_tau)
         # Transform sigma k → r: g_{iqks} → g_{iqrs}  (mean field W)
-        g_3 = contract("kr, iqks -> iqrs", b_sigma, g_2, backend="jax")
+        g_3 = self._transform_g_sigma(g_2, b_sigma)
         # Transform sigma i → p: g_{iqrs} → g_{pqrs}
         g_4 = contract("ip, iqrs -> pqrs", b_sigma.conj(), g_3, backend="jax")
         # Back-transform: g_{pqrs} → g_{iqrs}  (projected W)
         g_5 = contract("ip, pqrs -> iqrs", b_sigma, g_4, backend="jax")
         return g_3, g_4, g_5
+
+    def _precompute_frozen_g2(self, bs_frozen):
+        """Frozen-tau half of the 2-body transform for every interacting (s, k).
+
+        g_2 depends only on the frozen partner orbitals bs_frozen[k] and the
+        static spatial integrals, so it is constant across all Lanczos/Krylov
+        matvecs of a CMF substep. Computing it here once removes the dominant
+        O(N²M²) piece of the orbital matvec (see _rhs_b_linear).
+
+        Returns {(s, k): g_2} for every pair with an interaction in g_dict
+        (either ordering).
+        """
+        g2 = {}
+        for s in range(self.num_species):
+            for k in range(self.num_species):
+                if (s, k) in self.g_dict:
+                    g_spatial = self.g_dict[(s, k)]
+                elif (k, s) in self.g_dict:
+                    g_spatial = self._transpose_g(self.g_dict[(k, s)])
+                else:
+                    continue
+                g2[(s, k)] = self._transform_g_tau(g_spatial, bs_frozen[k])
+        return g2
 
     def _transpose_g(self, g):
         """Transpose 2-body integrals to swap particle 1 ↔ particle 2.
@@ -500,7 +547,7 @@ class MCTDHF_n_species:
         sigma = self.dCI.get_sigma(C, h_MO_list, g_MO_dict)
         return -sigma if self.imag_time else -1j * sigma
 
-    def _rhs_b_linear(self, b_s, s, h_current_s, D_inv, ds, bs_frozen):
+    def _rhs_b_linear(self, b_s, s, h_current_s, D_inv, ds, bs_frozen, g2_frozen):
         """Orbital RHS with frozen projector and density matrices (linear in b_s).
 
         Used by the CMF integrator for the decoupled orbital propagation.
@@ -511,6 +558,11 @@ class MCTDHF_n_species:
         applied in factored form as b_f·(b_f†·X), which costs O(N·M) per
         column instead of O(N²) — the dense form's O(N²M³) application to
         the mean-field tensor dominated the whole orbital RHS.
+
+        The frozen-tau half of the 2-body transform is NOT recomputed here:
+        callers precompute it once per substep via _precompute_frozen_g2
+        (it is loop-invariant across Krylov matvecs); only the cheap sigma
+        half, which depends on the varying b_s, runs per call.
 
         Parameters
         ----------
@@ -527,6 +579,9 @@ class MCTDHF_n_species:
         bs_frozen : list of jnp.ndarray
             Orbital matrices for all species (frozen at step start);
             bs_frozen[s] defines the frozen projector for species s.
+        g2_frozen : dict
+            Frozen-tau half-transformed 2-body integrals {(s, k): g_2}
+            from _precompute_frozen_g2(bs_frozen).
 
         Returns
         -------
@@ -542,15 +597,11 @@ class MCTDHF_n_species:
 
         # 2-body: mean-field contribution with frozen tau orbitals and P
         for k in range(self.num_species):
-            if (s, k) in self.g_dict:
-                g_spatial = self.g_dict[(s, k)]
-            elif (k, s) in self.g_dict:
-                g_spatial = self._transpose_g(self.g_dict[(k, s)])
-            else:
+            if (s, k) not in g2_frozen:
                 continue
 
-            # Transform g with b_s (varies) and bs_frozen[k] (fixed)
-            g_3, g_4, _ = self.transform_g(g_spatial, b_s, bs_frozen[k])
+            # Sigma half of the transform with the varying b_s
+            g_3 = self._transform_g_sigma(g2_frozen[(s, k)], b_s)
             g_proj = contract("jn, jqrs -> nqrs", b_f.conj(), g_3, backend="jax")
             g_5 = contract("jn, nqrs -> jqrs", b_f, g_proj, backend="jax")
 
@@ -1334,31 +1385,13 @@ class MCTDHF_n_species_DVR(MCTDHF_n_species):
     g_{ij} = V(x_i, x_j) (2D array instead of 4D).
     """
 
-    @partial(jit, static_argnums=0)
-    def transform_g(self, g, b_sigma, b_tau):
-        """Transform 2-body integrals for DVR basis (diagonal spatial integrals).
+    def _transform_g_tau(self, g, b_tau):
+        """Tau half for DVR: g_{ij} → g_{iqs} (j and l share a spatial index)."""
+        return contract("jq, js, ij -> iqs", b_tau.conj(), b_tau, g, backend="jax")
 
-        Parameters
-        ----------
-        g : jnp.ndarray
-            Spatial integrals g_{ij} (2D, diagonal in real space).
-        b_sigma, b_tau : jnp.ndarray
-            Orbital matrices for particle 1 and 2.
-
-        Returns
-        -------
-        g_3, g_4, g_5 : jnp.ndarray
-            Mean-field, fully transformed, and projected tensors.
-        """
-        # Transform tau: g_{ij} → g_{iqs}  (j and l share same spatial index in DVR)
-        g_2 = contract("jq, js, ij -> iqs", b_tau.conj(), b_tau, g, backend="jax")
-        # Transform sigma k → r: (i and k share same spatial index in DVR)
-        g_3 = contract("ir, iqs -> iqrs", b_sigma, g_2, backend="jax")
-        # Transform sigma i → p
-        g_4 = contract("ip, iqrs -> pqrs", b_sigma.conj(), g_3, backend="jax")
-        # Back-transform
-        g_5 = contract("ip, pqrs -> iqrs", b_sigma, g_4, backend="jax")
-        return g_3, g_4, g_5
+    def _transform_g_sigma(self, g_2, b_sigma):
+        """Sigma half for DVR: g_{iqs} → g_{iqrs} (i and k share a spatial index)."""
+        return contract("ir, iqs -> iqrs", b_sigma, g_2, backend="jax")
 
     def _transpose_g(self, g):
         """Transpose 2D DVR integrals: (i, j) → (j, i)."""

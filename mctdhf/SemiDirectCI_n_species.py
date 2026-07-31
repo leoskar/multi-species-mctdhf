@@ -224,8 +224,91 @@ class SemiDirectCI_n_species:
     # ── JAX-compiled CI operations ────────────────────────────────────────
 
     @partial(jit, static_argnums=0)
+    def precompute_ci_ops(self, h_list, g_dict):
+        """Contract the MO integrals with the excitation tensors once.
+
+        The E_pq·h and E_pqrs·g precontractions (and the inter-species
+        T1/Op_12 build) depend only on the integrals, not on C. When the
+        integrals are frozen — as they are across every Lanczos/Krylov
+        matvec of a CMF substep — this is loop-invariant work, so callers
+        that apply H|C⟩ repeatedly should call this once and then
+        :meth:`apply_ci_ops` per matvec.
+
+        Parameters
+        ----------
+        h_list : list of jnp.ndarray
+            Transformed 1-body integrals [h_0, h_1, ...], each (n_mo, n_mo).
+        g_dict : dict
+            Transformed 2-body integrals {(s1, s2): g_pqrs}.
+
+        Returns
+        -------
+        ops : (list, dict)
+            ops_diag[s] is the (n_dets_s, n_dets_s) determinant-space
+            operator acting on species s alone: E_pq·h_s plus, when an
+            intra-species interaction is present, 0.5·E_pqrs·g_ss.
+            ops_pair[(s1, s2)] is the (D_1, D_1, D_2, D_2) inter-species
+            operator with the counting factor folded in.
+        """
+        ops_diag = []
+        for s in range(self.num_species):
+            Op_s = contract("ijpq, pq -> ij", self.E_pq[s], h_list[s], backend="jax")
+            if (s, s) in g_dict:
+                # Intra-species: factor 0.5 (double counting in sum)
+                Op_s = Op_s + 0.5 * contract(
+                    "ijpqrs, pqrs -> ij", self.E_pqrs[s], g_dict[(s, s)], backend="jax"
+                )
+            ops_diag.append(Op_s)
+
+        ops_pair = {}
+        for (s1, s2), g_int in g_dict.items():
+            if s1 == s2:
+                continue
+            # If both (s1,s2) and (s2,s1) present → 0.5 each; else → 1.0
+            factor = 0.5 if (s2, s1) in g_dict else 1.0
+            T1 = contract("ijpr, pqrs -> ijqs", self.E_pq[s1], g_int, backend="jax")
+            Op_12 = contract("ijqs, klqs -> ijkl", T1, self.E_pq[s2], backend="jax")
+            ops_pair[(s1, s2)] = factor * Op_12
+
+        return ops_diag, ops_pair
+
+    @partial(jit, static_argnums=0)
+    def apply_ci_ops(self, ops, C):
+        """Apply precomputed determinant-space operators: σ = H|C⟩.
+
+        `ops` is the (ops_diag, ops_pair) pair from :meth:`precompute_ci_ops`.
+        Linear in C; cost is independent of the number of MO orbitals.
+        """
+        ops_diag, ops_pair = ops
+        sigma = jnp.zeros_like(C)
+
+        for s in range(self.num_species):
+            c_str, out_str, op_str = self._species_indices(s)
+            sigma = sigma + contract(
+                f"{op_str},...{c_str}->...{out_str}", ops_diag[s], C, backend="jax"
+            )
+
+        for (s1, s2), Op_12 in ops_pair.items():
+            c_indices = [chr(97 + i) for i in range(self.num_species)]
+            op_str = "A" + c_indices[s1] + "B" + c_indices[s2]
+            c_str = "".join(c_indices)
+            out_indices = list(c_indices)
+            out_indices[s1] = "A"
+            out_indices[s2] = "B"
+            out_str = "".join(out_indices)
+            sigma = sigma + contract(
+                f"{op_str},...{c_str}->...{out_str}", Op_12, C, backend="jax"
+            )
+
+        return sigma
+
+    @partial(jit, static_argnums=0)
     def get_sigma(self, C, h_list, g_dict):
         """Compute σ = H|Ψ⟩ for N species.
+
+        One-shot convenience wrapper: precompute_ci_ops + apply_ci_ops.
+        Callers that apply H repeatedly with frozen integrals (SIL/CN
+        matvecs) should precompute once instead.
 
         Parameters
         ----------
@@ -241,66 +324,7 @@ class SemiDirectCI_n_species:
         sigma : jnp.ndarray
             Same shape as C.
         """
-        sigma = jnp.zeros_like(C)
-
-        # 1-body contributions
-        for s in range(self.num_species):
-            sigma = sigma + self._contract_1body(C, h_list[s], s)
-
-        # 2-body contributions (with correct counting factors)
-        for (s1, s2), g_int in g_dict.items():
-            if s1 == s2:
-                # Intra-species: factor 0.5 (double counting in sum)
-                factor = 0.5
-                term = self._contract_2body_intra(C, g_int, s1)
-            else:
-                # If both (s1,s2) and (s2,s1) present → 0.5 each; else → 1.0
-                factor = 0.5 if (s2, s1) in g_dict else 1.0
-                term = self._contract_2body_inter(C, g_int, s1, s2)
-            sigma = sigma + factor * term
-
-        return sigma
-
-    def _contract_1body(self, C, h, s):
-        """Contract 1-body operator h on species s with CI tensor C."""
-        c_str, out_str, op_str = self._species_indices(s)
-
-        # Pre-contract E_pq with h → operator matrix Op_{IJ}
-        Op_s = contract("ijpq, pq -> ij", self.E_pq[s], h, backend="jax")
-        einsum_str = f"{op_str},...{c_str}->...{out_str}"
-        return contract(einsum_str, Op_s, C, backend="jax")
-
-    def _contract_2body_intra(self, C, g, s):
-        """Contract intra-species 2-body operator g on species s with CI tensor C."""
-        c_str, out_str, op_str = self._species_indices(s)
-
-        # Pre-contract E_pqrs with g → operator matrix Op_{IJ}
-        Op_s = contract("ijpqrs, pqrs -> ij", self.E_pqrs[s], g, backend="jax")
-        einsum_str = f"{op_str},...{c_str}->...{out_str}"
-        return contract(einsum_str, Op_s, C, backend="jax")
-
-    def _contract_2body_inter(self, C, g, s1, s2):
-        """Contract inter-species 2-body operator g_{pqrs} E^(s1)_{pr} E^(s2)_{qs}."""
-        # Step 1: contract g with E^(s1)
-        T1 = contract("ijpr, pqrs -> ijqs", self.E_pq[s1], g, backend="jax")
-
-        # Step 2: contract with E^(s2) → 4-index operator Op_{I1,J1,I2,J2}
-        Op_12 = contract("ijqs, klqs -> ijkl", T1, self.E_pq[s2], backend="jax")
-
-        # Step 3: contract with C
-        c_indices = [chr(97 + i) for i in range(self.num_species)]
-        in1_char, in2_char = c_indices[s1], c_indices[s2]
-        out1_char, out2_char = "A", "B"
-
-        op_str = out1_char + in1_char + out2_char + in2_char
-        c_str = "".join(c_indices)
-        out_indices = list(c_indices)
-        out_indices[s1] = out1_char
-        out_indices[s2] = out2_char
-        out_str = "".join(out_indices)
-
-        einsum_str = f"{op_str},...{c_str}->...{out_str}"
-        return contract(einsum_str, Op_12, C, backend="jax")
+        return self.apply_ci_ops(self.precompute_ci_ops(h_list, g_dict), C)
 
     # ── Reduced Density Matrices ──────────────────────────────────────────
 
