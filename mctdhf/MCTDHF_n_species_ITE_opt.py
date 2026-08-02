@@ -58,7 +58,7 @@ def _diag_solve_C(mctdh, h_MO_list, g_MO_dict, c_shape):
     for n in det_shape:
         n_dets_tot *= int(n)
 
-    eye = jnp.eye(n_dets_tot, dtype=jnp.complex64).reshape((n_dets_tot,) + det_shape)
+    eye = jnp.eye(n_dets_tot, dtype=mctdh.c_dtype).reshape((n_dets_tot,) + det_shape)
     sigma = mctdh.dCI.get_sigma(eye, h_MO_list, g_MO_dict)
     H_CI = sigma.reshape(n_dets_tot, n_dets_tot)
     H_CI = 0.5 * (H_CI + H_CI.conj().T)
@@ -195,7 +195,8 @@ class MCTDHF_n_species_ITE_opt:
     because `h_list` is threaded as a traced argument.
 
     Parameters mirror the relevant subset of :class:`MCTDHF_n_species`.
-    `imag_time` and the DVR basis are hard-wired.
+    `imag_time` and the DVR basis are hard-wired; the working precision is not
+    (see `dtype`, default `complex64`).
     """
 
     imag_time = True  # Used by reused helpers from `mctdhf/integrators.py`.
@@ -210,10 +211,34 @@ class MCTDHF_n_species_ITE_opt:
         state_weights=None,
         eps=1e-6,
         e_shift=0.0,
+        dtype=jnp.complex64,
     ):
         err = "Input lists must have the same length (number of species)."
         np.testing.assert_equal(len(num_particles), len(num_mctdhf_orbitals), err)
         np.testing.assert_equal(len(num_particles), len(num_spatial_orbitals), err)
+
+        # Working precision. Default complex64 reproduces the historical
+        # behaviour bit-for-bit; pass complex128 to run the whole scheme
+        # (state, integrals, D^-1, Lanczos) in double precision. Callers that
+        # opt in must also hand in float64 `g_dict`/`h_list` -- `integrate`
+        # casts `h_list` to `self.r_dtype`, so a float32 input is silently
+        # upcast (harmless) but a float32 `g_dict` would pin the 2-body
+        # integrals at single precision.
+        c_dtype = jnp.dtype(dtype)
+        if c_dtype not in (jnp.dtype(jnp.complex64), jnp.dtype(jnp.complex128)):
+            raise ValueError(
+                f"dtype must be complex64 or complex128, got {c_dtype}"
+            )
+        if c_dtype == jnp.dtype(jnp.complex128) and not jax.config.jax_enable_x64:
+            raise ValueError(
+                "dtype=complex128 requires jax_enable_x64=True; set "
+                "jax.config.update('jax_enable_x64', True) before constructing "
+                "the solver (otherwise JAX silently truncates back to 32 bit)."
+            )
+        self.c_dtype = c_dtype
+        self.r_dtype = jnp.dtype(
+            jnp.float32 if c_dtype == jnp.dtype(jnp.complex64) else jnp.float64
+        )
 
         self.num_species = len(num_particles)
         self.num_particles = num_particles
@@ -227,9 +252,9 @@ class MCTDHF_n_species_ITE_opt:
         self.eps = eps
 
         if state_weights is None:
-            w = jnp.ones(num_states, dtype=jnp.float32)
+            w = jnp.ones(num_states, dtype=self.r_dtype)
         else:
-            w = jnp.array(state_weights, dtype=jnp.float32)
+            w = jnp.array(state_weights, dtype=self.r_dtype)
             if w.shape != (num_states,):
                 raise ValueError(
                     f"state_weights must have shape ({num_states},), got {w.shape}"
@@ -352,11 +377,16 @@ class MCTDHF_n_species_ITE_opt:
 
     @partial(jit, static_argnums=0)
     def _invert_density_matrix(self, D):
-        """Tikhonov-regularised inverse via complex128 eigh."""
+        """Tikhonov-regularised inverse via complex128 eigh.
+
+        The eigendecomposition is always done in double precision; only the
+        returned inverse is cast back to the working dtype (a no-op when the
+        solver itself runs in complex128).
+        """
         D_64 = D.astype(jnp.complex128)
         eigvals_64, eigvecs_64 = jnp.linalg.eigh(D_64)
         D_inv_64 = (eigvecs_64 / (eigvals_64 + self.eps)) @ eigvecs_64.conj().T
-        return D_inv_64.astype(jnp.complex64)
+        return D_inv_64.astype(self.c_dtype)
 
     # ── Energy ────────────────────────────────────────────────────────────
 
@@ -494,7 +524,7 @@ class MCTDHF_n_species_ITE_opt:
         ts, ys : jnp.ndarray
             Saved times and packed state vectors.
         """
-        h_list_jnp = tuple(jnp.asarray(h, dtype=jnp.float32) for h in h_list)
+        h_list_jnp = tuple(jnp.asarray(h, dtype=self.r_dtype) for h in h_list)
 
         if bs_init_list is not None and len(bs_init_list) != self.num_species:
             raise ValueError(
@@ -508,7 +538,7 @@ class MCTDHF_n_species_ITE_opt:
                 eigvals, eigvecs = np.linalg.eigh(np.asarray(h_list_jnp[s]))
                 evals_list.append(eigvals)
                 b_init = eigvecs[:, : self.num_mctdhf_orbitals[s]]
-                bs_init_list.append(jnp.array(b_init, dtype=jnp.complex64))
+                bs_init_list.append(jnp.array(b_init, dtype=self.c_dtype))
 
         if C_init is None:
             if not evals_list:
@@ -526,25 +556,25 @@ class MCTDHF_n_species_ITE_opt:
             for state_idx in range(min(self.num_states, len(product_states))):
                 _, indices = product_states[state_idx]
                 C_init[(state_idx,) + indices] = 1.0
-            C_init = jnp.array(C_init, dtype=jnp.complex64)
+            C_init = jnp.array(C_init, dtype=self.c_dtype)
 
         rng = np.random.default_rng(42)
         if noise_C > 0:
             C_init = C_init + noise_C * jnp.array(
-                rng.standard_normal(C_init.shape), dtype=jnp.complex64
+                rng.standard_normal(C_init.shape), dtype=self.c_dtype
             )
             C_init = self.ortonorm_C(C_init)
         if noise_bs > 0:
             bs_init_list = [
                 self.ortonorm_b(
                     b + noise_bs * jnp.array(rng.standard_normal(b.shape),
-                                              dtype=jnp.complex64)
+                                              dtype=self.c_dtype)
                 )
                 for b in bs_init_list
             ]
 
         y_init = self._Cb_to_y(C_init, bs_init_list)
-        t_init_jnp = jnp.asarray(t_init, dtype=jnp.float32)
+        t_init_jnp = jnp.asarray(t_init, dtype=self.r_dtype)
 
         cache_key = (int(num_steps), float(dt), int(save_every), int(sil_b_krylov_dim))
         run = self._run_cache.get(cache_key)
