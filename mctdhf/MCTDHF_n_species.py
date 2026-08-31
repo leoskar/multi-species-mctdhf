@@ -156,6 +156,7 @@ class MCTDHF_n_species:
         eps=1e-6,
         state_weights=None,
         e_shift=0.0,
+        ci_sparse=True,
     ):
         err_msg = "Input lists must have the same length (number of species)."
         np.testing.assert_equal(len(num_particles), len(num_mctdhf_orbitals), err_msg)
@@ -182,7 +183,12 @@ class MCTDHF_n_species:
                 )
         self.g_dict = g_dict
 
-        self.dCI = SemiDirectCI_n_species(num_mctdhf_orbitals, num_particles)
+        # ci_sparse=False selects the pre-2026-08-31 dense excitation
+        # tensors; see SemiDirectCI_n_species.__init__ for when that is
+        # the better choice (very small CI dimension) and for the
+        # measured trade-off.
+        self.dCI = SemiDirectCI_n_species(
+            num_mctdhf_orbitals, num_particles, sparse=ci_sparse)
         self.num_dets = self.dCI.num_dets
         self.num_states = num_states
         self.imag_time = imag_time
