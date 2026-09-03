@@ -643,6 +643,86 @@ def _bs_modified_midpoint(rhs_fn, y0, dt, n_steps):
     return 0.5 * (z_curr + z_prev + h * rhs_fn(z_curr))
 
 
+# Dormand-Prince 5(4) tableau, used by _dop_solve_bs.
+_DP_C = (0.0, 1/5, 3/10, 4/5, 8/9, 1.0, 1.0)
+_DP_A = (
+    (),
+    (1/5,),
+    (3/40, 9/40),
+    (44/45, -56/15, 32/9),
+    (19372/6561, -25360/2187, 64448/6561, -212/729),
+    (9017/3168, -355/33, 46732/5247, 49/176, -5103/18656),
+    (35/384, 0.0, 500/1113, 125/192, -2187/6784, 11/84),
+)
+_DP_B5 = (35/384, 0.0, 500/1113, 125/192, -2187/6784, 11/84, 0.0)
+
+
+def _dop_solve_bs(
+    mctdh,
+    bs_start,
+    h_current,
+    D_invs,
+    ds,
+    bs_frozen,
+    g2_frozen,
+    dt,
+    b_shapes,
+    n_substeps=1,
+):
+    """Orbital substep by fixed-step Dormand-Prince 5(4).
+
+    The CMF orbital sub-problem db/dt = A_s b has A_s FROZEN over the substep,
+    so it is an autonomous linear ODE — the case an explicit Runge-Kutta method
+    handles best. Cost per species is ``7 * n_substeps`` evaluations of
+    ``_rhs_b_linear``, against:
+
+      * ``_diag_solve_bs``: ``n_spatial * norb`` evaluations to build A_s
+        densely (384 at norb = 6, n_spatial = 64) plus a dense expm — exact in
+        the linearised substep, but the most expensive orbital solver by far;
+      * ``_cn_solve_bs``: one BiCGSTAB solve — cheap, but the Cayley map is
+        NOT unitary when A_s is non-Hermitian (which it is, under the
+        (1-P)(h+W)D^-1 gauge), so b^H b drifts and regauge becomes mandatory;
+        and for stiff modes its amplification factor tends to -1 rather than
+        tracking exp, i.e. it aliases rather than diverging — a wrong answer
+        that looks stable.
+
+    DOP makes no Hermiticity assumption, builds no matrix and solves no linear
+    system. Being explicit it is stability-limited by ``dt * rho(A_s) <~ 3``, so
+    ``n_substeps`` splits the substep when the frozen generator is stiff; that
+    is the same device ``_cn_solve_bs`` uses via ``n_orbital_substeps`` in the
+    half-step integrator.
+
+    Returns ``(bs_new, zero_error)`` to match the ``_sil_solve_bs`` /
+    ``_diag_solve_bs`` tuple shape.
+    """
+    bs_new = []
+    h = dt / n_substeps
+    for s, b_s in enumerate(bs_start):
+
+        def rhs(b, _s=s):
+            return mctdh._rhs_b_linear(
+                b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, g2_frozen
+            )
+
+        def one_substep(b, _):
+            ks = []
+            for i in range(7):
+                bi = b
+                for j, aij in enumerate(_DP_A[i]):
+                    if aij != 0.0:
+                        bi = bi + h * aij * ks[j]
+                ks.append(rhs(bi))
+            out = b
+            for coef, k in zip(_DP_B5, ks):
+                if coef != 0.0:
+                    out = out + h * coef * k
+            return out, None
+
+        b_out, _ = jax.lax.scan(one_substep, b_s, None, length=n_substeps)
+        bs_new.append(b_out)
+    return bs_new, jnp.zeros((), dtype=bs_start[0].real.dtype)
+
+
 def _bs_solve_bs(
     mctdh,
     bs_start,
@@ -736,12 +816,14 @@ _B_KWARG_KEYS_CMF = {
     "cn": ("solver_tol", "max_solver_iter"),
     "sil": ("krylov_dim",),
     "diagonalize": (),
+    "dop": ("n_substeps",),
 }
 _B_KWARG_KEYS_HALF = {
     "cn": ("solver_tol", "max_solver_iter", "n_orbital_substeps"),
     "sil": ("krylov_dim",),
     "bs": ("bs_sequence",),
     "diagonalize": ("orbital_x64",),
+    "dop": ("n_substeps",),
 }
 
 
@@ -804,7 +886,7 @@ def get_cmf_integrator(
             f"Unknown c_propagator '{c_propagator}'. "
             f"Use 'cn', 'sil', or 'diagonalize'."
         )
-    if b_propagator not in ("cn", "sil", "diagonalize"):
+    if b_propagator not in ("cn", "sil", "diagonalize", "dop"):
         raise ValueError(
             f"Unknown b_propagator '{b_propagator}'. "
             f"Use 'cn', 'sil', or 'diagonalize'."
@@ -822,6 +904,7 @@ def get_cmf_integrator(
     b_solver_tol = b_kwargs.get("solver_tol", 1e-8)
     b_max_iter = b_kwargs.get("max_solver_iter", 100)
     b_krylov_dim = b_kwargs.get("krylov_dim", 20)
+    b_n_substeps = b_kwargs.get("n_substeps", 1)
 
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
     b_shapes = [
@@ -884,6 +967,19 @@ def get_cmf_integrator(
                 g2_frozen,
                 dt,
                 b_shapes,
+            )
+        elif b_propagator == "dop":
+            bs_new, _ = _dop_solve_bs(
+                mctdh,
+                bs,
+                h_current,
+                D_invs,
+                ds,
+                bs,
+                g2_frozen,
+                dt,
+                b_shapes,
+                b_n_substeps,
             )
         else:
             bs_new = _cn_solve_bs(
@@ -963,7 +1059,7 @@ def get_cmf_half_step_integrator(
             f"Unknown c_propagator '{c_propagator}'. "
             f"Use 'cn', 'sil', or 'diagonalize'."
         )
-    if b_propagator not in ("cn", "bs", "sil", "diagonalize"):
+    if b_propagator not in ("cn", "bs", "sil", "diagonalize", "dop"):
         raise ValueError(
             f"Unknown b_propagator '{b_propagator}'. "
             f"Use 'cn', 'bs', 'sil', or 'diagonalize'."
@@ -981,6 +1077,7 @@ def get_cmf_half_step_integrator(
     b_solver_tol = b_kwargs.get("solver_tol", 1e-8)
     b_max_iter = b_kwargs.get("max_solver_iter", 100)
     b_krylov_dim = b_kwargs.get("krylov_dim", 20)
+    b_n_substeps = b_kwargs.get("n_substeps", 1)
     n_sub = b_kwargs.get("n_orbital_substeps", 1)
     bs_sequence = b_kwargs.get("bs_sequence", (2, 4, 6, 8, 12, 16))
     b_orbital_x64 = b_kwargs.get("orbital_x64", False)
@@ -1072,6 +1169,19 @@ def get_cmf_half_step_integrator(
                 b_shapes,
                 compute_x64=b_orbital_x64,
             )
+        elif b_propagator == "dop":
+            bs_half, _ = _dop_solve_bs(
+                mctdh,
+                bs,
+                h_current_t,
+                D_invs_t,
+                ds_t,
+                bs,
+                g2_t,
+                dt_half,
+                b_shapes,
+                b_n_substeps,
+            )
         else:
             dt_orb_pred = dt_half / n_sub
             bs_half = bs
@@ -1136,6 +1246,19 @@ def get_cmf_half_step_integrator(
                 dt,
                 b_shapes,
                 compute_x64=b_orbital_x64,
+            )
+        elif b_propagator == "dop":
+            bs_new, _ = _dop_solve_bs(
+                mctdh,
+                bs,
+                h_current_half,
+                D_invs_half,
+                ds_half,
+                bs_half,
+                g2_half,
+                dt,
+                b_shapes,
+                b_n_substeps,
             )
         else:
             dt_orb_corr = dt / n_sub
