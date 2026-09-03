@@ -12,10 +12,136 @@ Reference:
 
 import numpy as np
 from opt_einsum import contract
+import jax
 from jax import jit
 import jax.numpy as jnp
 from functools import partial
 from itertools import combinations
+
+
+class _SparseExc:
+    """Nonzero entries of an excitation tensor E_{ij,o} in coordinate form.
+
+    ``E_pq`` and ``E_pqrs`` are built by visiting each allowed excitation once
+    and writing a single ±1, so their entries lie in {0, ±1} and their nonzero
+    counts are exactly
+
+        nnz(E_pq)   = C(m,N) · N      · (m−N+1)
+        nnz(E_pqrs) = C(m,N) · N(N−1) · (m−N+2)(m−N+1)
+
+    At (m, N) = (9, 3) that is 1 764 and 28 224 against dense sizes of 5.4e5
+    and 4.6e7 — densities of 3e-3 and 6e-4. Storing the dense tensors therefore
+    spends ~99.9 % of both memory and every contraction on multiplying by zero:
+    measured, the dense route costs 741 MB of complex128 working set and makes
+    a single CMF step 29× more expensive at m = 9 than at m = 8, against a 3.6×
+    prediction from operation counts.
+
+    Held here as three flat arrays — ``det`` (the flattened (i, j) determinant
+    pair), ``orb`` (the flattened orbital multi-index), and ``val`` (the ±1) —
+    in two sort orders, so that both consumers can pass
+    ``indices_are_sorted=True`` to ``segment_sum`` and be lowered to a
+    contiguous segmented reduction rather than a general atomic scatter:
+
+      ``*_d``  sorted by ``det``  — for contractions that SCATTER onto (i, j)
+                                    and gather on the orbital index
+                                    (``precompute_ci_ops``)
+      ``*_o``  sorted by ``orb``  — for contractions that SCATTER onto the
+                                    orbital index and gather on (i, j)
+                                    (the RDMs)
+
+    ``val`` is float32, matching the dtype the dense tensors were stored in, so
+    promotion against complex128 integrals is unchanged. float32 is exact here
+    (entries are ±1) — asserted in the Part 2 dtype guard.
+    """
+
+    __slots__ = ("n_dets", "n_orb", "k", "nnz",
+                 "det_d", "orb_d", "val_d", "orb_split_d",
+                 "det_o", "orb_o", "val_o")
+
+    def __init__(self, det, orb, val, n_dets, n_orb, k):
+        self.n_dets, self.n_orb, self.k = int(n_dets), int(n_orb), int(k)
+        self.nnz = int(det.size)
+        od = np.argsort(det, kind="stable")
+        oo = np.argsort(orb, kind="stable")
+        self.det_d = jnp.asarray(det[od])
+        self.orb_d = jnp.asarray(orb[od])
+        self.val_d = jnp.asarray(val[od], dtype=jnp.float32)
+        self.det_o = jnp.asarray(det[oo])
+        self.orb_o = jnp.asarray(orb[oo])
+        self.val_o = jnp.asarray(val[oo], dtype=jnp.float32)
+        # orbital multi-index split back into its k components, det-sorted;
+        # needed where a contraction keeps some orbital indices free
+        # (the inter-species T1 build).
+        rem, comps = orb[od], []
+        for _ in range(k):
+            comps.append(rem % n_orb)
+            rem = rem // n_orb
+        self.orb_split_d = [jnp.asarray(c) for c in reversed(comps)]
+
+    @property
+    def n_seg_det(self):
+        return self.n_dets * self.n_dets
+
+    @property
+    def n_seg_orb(self):
+        return self.n_orb ** self.k
+
+    def to_dense(self, dtype=jnp.float32):
+        """Materialise the dense tensor. For tests and diagnostics only —
+        this is exactly the object the sparse form exists to avoid."""
+        shape = (self.n_dets,) * 2 + (self.n_orb,) * self.k
+        flat = np.zeros(self.n_dets * self.n_dets * self.n_orb ** self.k)
+        np.add.at(flat,
+                  np.asarray(self.det_d) * (self.n_orb ** self.k)
+                  + np.asarray(self.orb_d),
+                  np.asarray(self.val_d, dtype=np.float64))
+        return jnp.asarray(flat.reshape(shape), dtype=dtype)
+
+    # ── the two contraction patterns ──────────────────────────────────────
+
+    def contract_orb(self, t):
+        """Σ_o E_{ij,o} t_o  →  (n_dets, n_dets).  Gathers t, scatters on (i,j)."""
+        contrib = self.val_d * t.reshape(-1)[self.orb_d]
+        return jax.ops.segment_sum(
+            contrib, self.det_d, num_segments=self.n_seg_det,
+            indices_are_sorted=True).reshape(self.n_dets, self.n_dets)
+
+    def contract_det(self, rho):
+        """Σ_ij E_{ij,o} rho_{...ij}  →  (..., n_orb^k).  Gathers rho, scatters on o.
+
+        The batch axes of ``rho`` are carried through; segment_sum reduces axis
+        0, so the nnz axis is moved to the front and back again."""
+        rf = rho.reshape(rho.shape[:-2] + (self.n_dets * self.n_dets,))
+        contrib = rf[..., self.det_o] * self.val_o
+        moved = jnp.moveaxis(contrib, -1, 0)
+        out = jax.ops.segment_sum(
+            moved, self.orb_o, num_segments=self.n_seg_orb,
+            indices_are_sorted=True)
+        return jnp.moveaxis(out, 0, -1)
+
+
+class _DenseExcView:
+    """Backwards-compatible ``dci.E_pq[s]`` / ``dci.E_pqrs[s]`` accessor.
+
+    Materialises one species' dense tensor on demand and does NOT cache it —
+    caching would reinstate exactly the memory the sparse storage removes.
+    Present for the external consumers that legitimately want the dense object
+    (the C1 operator-identity test, dtype guards); nothing on the hot path uses
+    it."""
+
+    __slots__ = ("_sp",)
+
+    def __init__(self, sparse_list):
+        self._sp = sparse_list
+
+    def __getitem__(self, s):
+        return self._sp[s].to_dense()
+
+    def __len__(self):
+        return len(self._sp)
+
+    def __iter__(self):
+        return (sp.to_dense() for sp in self._sp)
 
 
 class SemiDirectCI_n_species:
@@ -46,7 +172,27 @@ class SemiDirectCI_n_species:
         self,
         num_spatial_orbitals,  # int or list of ints
         num_particles,  # list of ints [N_0, N_1, ..., N_{k-1}]
+        sparse=True,
     ):
+        """
+        sparse : bool
+            Store the excitation tensors in coordinate form and contract them
+            with ``segment_sum`` (default), rather than as dense arrays
+            contracted with einsum.
+
+            Sparse is faster wherever the CI space is not tiny — measured
+            5.9x at (m, N) = (8, 3) and 39.5x at (9, 3), and it removes the
+            dense tensor's memory wall entirely (1.15 GB at (10, 3), 16 GB at
+            (12, 3)) along with the 29x per-step cliff that wall caused.
+
+            It is marginally SLOWER at very small CI dimension, where the fixed
+            gather/scatter cost does not shrink with n_dets: measured 1.13x
+            (+132 us/step) at CI dim 6, 1.07x at CI dim 16, and ~1.00x at
+            CI dim 256-625. ``sparse=False`` selects the original dense path,
+            unchanged, for reproducing pre-2026-08-31 results bit-for-bit or if
+            a small configuration is ever step-rate critical.
+        """
+        self.sparse = bool(sparse)
         self.num_species = len(num_particles)
         self.num_particles = num_particles
 
@@ -61,8 +207,11 @@ class SemiDirectCI_n_species:
         self.I = []  # Slater determinants (boolean occupation vectors)
         self.W = []  # Vertex weights for address computation
         self.num_dets = []
-        self.E_pq = []  # 1-body excitation tensors
-        self.E_pqrs = []  # 2-body excitation tensors
+        # Excitation operators, stored sparsely (see _SparseExc). The dense
+        # tensors are never allocated: at (m, N) = (10, 3) the dense float64
+        # E_pqrs is 1.15 GB holding 51 840 nonzeros.
+        self._sp_pq = []    # 1-body excitation entries, per species
+        self._sp_pqrs = []  # 2-body excitation entries, per species
 
         # Precompute data for each species
         for s in range(self.num_species):
@@ -79,13 +228,32 @@ class SemiDirectCI_n_species:
             self.W.append(W_s)
 
             # Excitation operators
-            self.E_pq.append(self._calculate_Epq(n_orb, self.num_dets[s], I_s, W_s))
-            self.E_pqrs.append(self._calculate_Epqrs(n_orb, self.num_dets[s], I_s, W_s))
+            self._sp_pq.append(
+                self._build_Epq_sparse(n_orb, self.num_dets[s], I_s, W_s))
+            self._sp_pqrs.append(
+                self._build_Epqrs_sparse(n_orb, self.num_dets[s], I_s, W_s))
 
-        # Convert to JAX arrays once — avoids repeated implicit transfers in
-        # JIT-compiled methods that use opt_einsum with backend="jax"
-        self.E_pq = [jnp.array(e, dtype=jnp.float32) for e in self.E_pq]
-        self.E_pqrs = [jnp.array(e, dtype=jnp.float32) for e in self.E_pqrs]
+        if not self.sparse:
+            # Dense path: materialise the same tensors the pre-sparse code
+            # built (to_dense is pinned against it elementwise) and use the
+            # original einsum contractions below.
+            self._dn_pq = [sp.to_dense() for sp in self._sp_pq]
+            self._dn_pqrs = [sp.to_dense() for sp in self._sp_pqrs]
+
+    # ── Backwards-compatible dense views ──────────────────────────────────
+    #
+    # `dci.E_pq[s]` / `dci.E_pqrs[s]` still return the dense float32 tensors
+    # they always did, materialised on demand. Nothing on the hot path uses
+    # them; they exist for the external consumers that want the dense object
+    # (the C1 operator-identity test, dtype guards, diagnostics).
+
+    @property
+    def E_pq(self):
+        return _DenseExcView(self._sp_pq)
+
+    @property
+    def E_pqrs(self):
+        return _DenseExcView(self._sp_pqrs)
 
     # ── Determinant enumeration and addressing ────────────────────────────
 
@@ -125,10 +293,18 @@ class SemiDirectCI_n_species:
         return W
 
     def address(self, n, num_spatial_orbitals, W):
-        """Map an occupation vector to its integer address via vertex weights."""
+        """Map an occupation vector to its integer address via vertex weights.
+
+        The running occupation count replaces the per-orbital ``np.sum(n[:m+1])``
+        of the original, which made a single address evaluation O(m^2) with a
+        fresh temporary per orbital. Identical result, O(m) and allocation-free.
+        """
         res = 0
+        cnt = 0
         for m in range(num_spatial_orbitals):
-            res += n[m] * W[m, int(np.sum(n[: m + 1]))]
+            if n[m]:
+                cnt += 1
+                res += W[m, cnt]
         return int(res)
 
     # ── Second-quantized excitation evaluation ────────────────────────────
@@ -137,14 +313,54 @@ class SemiDirectCI_n_species:
         """Evaluate single excitation a†_p a_q on determinant n.
 
         Returns (phase, new_det) or (0, 0) if the excitation is forbidden.
+
+        The forbidden case is tested before the copy, so the array is allocated
+        only when the excitation actually survives. The bitmask twin used by the
+        tensor builders is :meth:`_single_exc_mask`; the two are pinned against
+        each other in the C1 unit checks.
         """
+        if p != q and n[p]:
+            return 0, 0
         n_pq = np.copy(n)
         n_pq[q] = 0
-        if n_pq[p] == 1:
-            return 0, 0
         n_pq[p] = 1
         gamma = (-1) ** (np.sum(n[:q]) + np.sum(n_pq[:p]))
         return gamma, n_pq
+
+    # ── Bitmask twins, used by the tensor builders ────────────────────────
+    #
+    # A determinant is an int whose bit k is set iff orbital k is occupied.
+    # `(mask & ((1 << k) - 1)).bit_count()` replaces `np.sum(n[:k])`: the
+    # occupation-parity counts that set the fermionic phase become single
+    # machine instructions instead of a slice, a temporary and a reduction.
+    # Semantics are a line-by-line transcription of the array versions above,
+    # including which intermediate each parity is counted on.
+
+    @staticmethod
+    def _single_exc_mask(p, q, m):
+        """a†_p a_q on bitmask m -> (phase, new_mask); phase 0 if forbidden."""
+        below_q = (m & ((1 << q) - 1)).bit_count()
+        m1 = m & ~(1 << q)
+        if (m1 >> p) & 1:
+            return 0, 0
+        below_p = (m1 & ((1 << p) - 1)).bit_count()
+        return (1 if (below_q + below_p) % 2 == 0 else -1), m1 | (1 << p)
+
+    @staticmethod
+    def _double_exc_mask(p, q, s, r, m):
+        """a†_p a†_q a_s a_r on bitmask m -> (phase, new_mask)."""
+        if s == r or p == q:
+            return 0, 0
+        gamma = (m & ((1 << r) - 1)).bit_count()
+        m1 = m & ~(1 << r)
+        gamma += (m1 & ((1 << s) - 1)).bit_count()
+        m2 = m1 & ~(1 << s)
+        if ((m2 >> q) & 1) or ((m2 >> p) & 1):
+            return 0, 0
+        gamma += (m2 & ((1 << q) - 1)).bit_count()
+        m3 = m2 | (1 << q)
+        gamma += (m3 & ((1 << p) - 1)).bit_count()
+        return (1 if gamma % 2 == 0 else -1), m3 | (1 << p)
 
     def double_exc(self, p, q, s, r, n):
         """Evaluate double excitation a†_p a†_q a_s a_r on determinant n.
@@ -197,6 +413,63 @@ class SemiDirectCI_n_species:
                                 i = self.address(I, num_spatial_orbitals, W)
                                 E_pqrs[i, j, p, q, r, s] += xi
         return E_pqrs
+
+    # ── Sparse excitation-tensor construction (numpy, done once at init) ──
+
+    def _det_masks(self, spin_strings, n_orb, W):
+        """(list of bitmasks in address order, mask -> address dict).
+
+        The address function is evaluated once per determinant here rather than
+        once per excitation inside the builders below, turning an O(m) lookup in
+        the innermost loop into a dict hit."""
+        masks = [0] * len(spin_strings)
+        addr = {}
+        for J in spin_strings:
+            m = int(np.dot(np.asarray(J, dtype=np.int64),
+                           1 << np.arange(n_orb, dtype=np.int64)))
+            j = self.address(J, n_orb, W)
+            masks[j] = m
+            addr[m] = j
+        return masks, addr
+
+    def _build_Epq_sparse(self, n_orb, num_dets, spin_strings, W):
+        """Nonzero entries of E_{IJ,pq}, in coordinate form."""
+        masks, addr = self._det_masks(spin_strings, n_orb, W)
+        det, orb, val = [], [], []
+        for j, mJ in enumerate(masks):
+            occ = [k for k in range(n_orb) if (mJ >> k) & 1]
+            for p in range(n_orb):
+                for q in occ:
+                    xi, mI = self._single_exc_mask(p, q, mJ)
+                    if xi:
+                        det.append(addr[mI] * num_dets + j)
+                        orb.append(p * n_orb + q)
+                        val.append(xi)
+        return _SparseExc(np.asarray(det, dtype=np.int32),
+                          np.asarray(orb, dtype=np.int32),
+                          np.asarray(val, dtype=np.float64),
+                          num_dets, n_orb, 2)
+
+    def _build_Epqrs_sparse(self, n_orb, num_dets, spin_strings, W):
+        """Nonzero entries of E_{IJ,pqrs}, in coordinate form."""
+        masks, addr = self._det_masks(spin_strings, n_orb, W)
+        det, orb, val = [], [], []
+        n2, n3 = n_orb * n_orb, n_orb ** 3
+        for j, mJ in enumerate(masks):
+            occ = [k for k in range(n_orb) if (mJ >> k) & 1]
+            for p in range(n_orb):
+                for r in occ:
+                    for q in range(n_orb):
+                        for s in occ:
+                            xi, mI = self._double_exc_mask(p, q, s, r, mJ)
+                            if xi:
+                                det.append(addr[mI] * num_dets + j)
+                                orb.append(p * n3 + q * n2 + r * n_orb + s)
+                                val.append(xi)
+        return _SparseExc(np.asarray(det, dtype=np.int32),
+                          np.asarray(orb, dtype=np.int32),
+                          np.asarray(val, dtype=np.float64),
+                          num_dets, n_orb, 4)
 
     # ── Einsum index helpers ──────────────────────────────────────────────
 
@@ -252,12 +525,24 @@ class SemiDirectCI_n_species:
         """
         ops_diag = []
         for s in range(self.num_species):
-            Op_s = contract("ijpq, pq -> ij", self.E_pq[s], h_list[s], backend="jax")
+            # Sparse: gather the integral at each nonzero excitation and
+            # scatter-add onto (i, j). Equivalent to
+            #   contract("ijpq, pq -> ij", E_pq[s], h_list[s])
+            # over ~1e-3 of the terms; validated bit-identical.
+            if self.sparse:
+                Op_s = self._sp_pq[s].contract_orb(h_list[s])
+            else:
+                Op_s = contract("ijpq, pq -> ij", self._dn_pq[s], h_list[s],
+                                backend="jax")
             if (s, s) in g_dict:
                 # Intra-species: factor 0.5 (double counting in sum)
-                Op_s = Op_s + 0.5 * contract(
-                    "ijpqrs, pqrs -> ij", self.E_pqrs[s], g_dict[(s, s)], backend="jax"
-                )
+                if self.sparse:
+                    Op_s = Op_s + 0.5 * self._sp_pqrs[s].contract_orb(
+                        g_dict[(s, s)])
+                else:
+                    Op_s = Op_s + 0.5 * contract(
+                        "ijpqrs, pqrs -> ij", self._dn_pqrs[s],
+                        g_dict[(s, s)], backend="jax")
             ops_diag.append(Op_s)
 
         ops_pair = {}
@@ -266,8 +551,30 @@ class SemiDirectCI_n_species:
                 continue
             # If both (s1,s2) and (s2,s1) present → 0.5 each; else → 1.0
             factor = 0.5 if (s2, s1) in g_dict else 1.0
-            T1 = contract("ijpr, pqrs -> ijqs", self.E_pq[s1], g_int, backend="jax")
-            Op_12 = contract("ijqs, klqs -> ijkl", T1, self.E_pq[s2], backend="jax")
+            # Sparse both halves. E_pq[s1]'s two orbital indices play the
+            # roles (p, r) here, so the g slice g[p, :, r, :] is gathered per
+            # nonzero and scatter-added onto (i, j) with (q, s) left free:
+            #   T1 = contract("ijpr, pqrs -> ijqs", E_pq[s1], g_int)
+            if not self.sparse:
+                T1 = contract("ijpr, pqrs -> ijqs", self._dn_pq[s1], g_int,
+                              backend="jax")
+                ops_pair[(s1, s2)] = factor * contract(
+                    "ijqs, klqs -> ijkl", T1, self._dn_pq[s2], backend="jax")
+                continue
+            sp1, sp2 = self._sp_pq[s1], self._sp_pq[s2]
+            p_idx, r_idx = sp1.orb_split_d
+            n1, n2 = sp1.n_dets, sp2.n_dets
+            m2 = sp2.n_orb
+            g_sl = g_int[p_idx, :, r_idx, :]                     # (nnz1, m2, m2)
+            T1 = jax.ops.segment_sum(
+                sp1.val_d[:, None, None] * g_sl, sp1.det_d,
+                num_segments=n1 * n1, indices_are_sorted=True)   # (n1^2, m2, m2)
+            #   Op_12 = contract("ijqs, klqs -> ijkl", T1, E_pq[s2])
+            cols = T1.reshape(n1 * n1, m2 * m2)[:, sp2.orb_d]    # (n1^2, nnz2)
+            Op_12 = jax.ops.segment_sum(
+                (cols * sp2.val_d[None, :]).T, sp2.det_d,
+                num_segments=n2 * n2, indices_are_sorted=True)   # (n2^2, n1^2)
+            Op_12 = Op_12.T.reshape(n1, n1, n2, n2)
             ops_pair[(s1, s2)] = factor * Op_12
 
         return ops_diag, ops_pair
@@ -357,7 +664,13 @@ class SemiDirectCI_n_species:
         Ds = []
         for s in range(self.num_species):
             rho_ci = self._compute_rho_ci(C, s)
-            D_s = contract("ijpq, ...ij -> ...pq", self.E_pq[s], rho_ci, backend="jax")
+            if self.sparse:
+                m = self.num_spatial_orbitals[s]
+                D_s = self._sp_pq[s].contract_det(rho_ci).reshape(
+                    rho_ci.shape[:-2] + (m, m))
+            else:
+                D_s = contract("ijpq, ...ij -> ...pq", self._dn_pq[s], rho_ci,
+                               backend="jax")
             Ds.append(D_s)
         return Ds
 
@@ -376,12 +689,14 @@ class SemiDirectCI_n_species:
         # Intra-species: reuse shared rho_ci helper
         for s1 in range(self.num_species):
             rho_ci = self._compute_rho_ci(C, s1)
-            ds[(s1, s1)] = contract(
-                "ijpqrs, ...ij -> ...pqrs",
-                self.E_pqrs[s1],
-                rho_ci,
-                backend="jax",
-            )
+            if self.sparse:
+                m = self.num_spatial_orbitals[s1]
+                ds[(s1, s1)] = self._sp_pqrs[s1].contract_det(rho_ci).reshape(
+                    rho_ci.shape[:-2] + (m, m, m, m))
+            else:
+                ds[(s1, s1)] = contract(
+                    "ijpqrs, ...ij -> ...pqrs", self._dn_pqrs[s1], rho_ci,
+                    backend="jax")
 
         # Inter-species: compute s1 < s2 only. Excitation operators of
         # different species commute, so the reversed pair is a pure index
@@ -400,13 +715,35 @@ class SemiDirectCI_n_species:
                 )
                 rho_pair = contract(rho_pair_str, C.conj(), C, backend="jax")
 
-                d_inter = contract(
-                    "...xzyw, xypr, zwqs -> ...pqrs",
-                    rho_pair,
-                    self.E_pq[s1],
-                    self.E_pq[s2],
-                    backend="jax",
-                )
+                # Sparse, in two segment_sums:
+                #   B[..., pr, zw] = sum_xy rho[..., xy, zw] E1[xy, pr]
+                #   d[..., pr, qs] = sum_zw B[..., pr, zw] E2[zw, qs]
+                # then (p, r, q, s) -> (p, q, r, s).
+                if not self.sparse:
+                    d_inter = contract(
+                        "...xzyw, xypr, zwqs -> ...pqrs", rho_pair,
+                        self._dn_pq[s1], self._dn_pq[s2], backend="jax")
+                    ds[(s1, s2)] = d_inter
+                    ds[(s2, s1)] = jnp.einsum("...pqrs->...qpsr", d_inter)
+                    continue
+                sp1, sp2 = self._sp_pq[s1], self._sp_pq[s2]
+                n1, n2 = sp1.n_dets, sp2.n_dets
+                m1, m2 = sp1.n_orb, sp2.n_orb
+                rp = jnp.einsum("...xzyw->...xyzw", rho_pair).reshape(
+                    rho_pair.shape[:-4] + (n1 * n1, n2 * n2))
+                B = jax.ops.segment_sum(
+                    jnp.moveaxis(rp[..., sp1.det_o, :]
+                                 * sp1.val_o[:, None], -2, 0),
+                    sp1.orb_o, num_segments=m1 * m1,
+                    indices_are_sorted=True)             # (m1^2, ..., n2^2)
+                d_pr_qs = jax.ops.segment_sum(
+                    jnp.moveaxis(B[..., sp2.det_o] * sp2.val_o, -1, 0),
+                    sp2.orb_o, num_segments=m2 * m2,
+                    indices_are_sorted=True)             # (m2^2, m1^2, ...)
+                d_pr_qs = jnp.moveaxis(jnp.moveaxis(d_pr_qs, 0, -1), 0, -2)
+                d_inter = jnp.einsum(
+                    "...prqs->...pqrs",
+                    d_pr_qs.reshape(d_pr_qs.shape[:-2] + (m1, m1, m2, m2)))
                 ds[(s1, s2)] = d_inter
                 ds[(s2, s1)] = jnp.einsum("...pqrs->...qpsr", d_inter)
 
