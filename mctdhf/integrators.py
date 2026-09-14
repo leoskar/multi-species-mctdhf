@@ -223,6 +223,24 @@ def _cn_solve_bs(
     return bs_new
 
 
+def _sil_expm_coeffs(alphas, betas, dt, imag_time, vec_dtype, sign=-1.0):
+    """First column of exp(sign*i*dt*T) (RTE) / exp(sign*dt*T) (ITE), T the
+    Lanczos tridiagonal. T and the exponential are formed in double regardless
+    of the vector dtype: in complex64 the k x k expm is non-unitary by ~5e-7
+    per step, a norm bias that dominates the CI propagation at large CI blocks
+    (Part_2 record, 2026-09-14). The coefficients are cast back to `vec_dtype`
+    for the reconstruction with the stored basis."""
+    f64 = jax.dtypes.canonicalize_dtype(jnp.float64)
+    a = alphas.astype(f64)
+    b = betas[:-1].astype(f64)
+    T = jnp.diag(a) + jnp.diag(b, 1) + jnp.diag(b, -1)
+    if imag_time:
+        expT = jax.scipy.linalg.expm(sign * dt * T)
+    else:
+        expT = jax.scipy.linalg.expm(sign * 1j * dt * T)
+    return expT[:, 0].astype(vec_dtype)
+
+
 def _sil_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10):
     """Short Iterative Lanczos (SIL) propagation of CI coefficients.
 
@@ -291,17 +309,9 @@ def _sil_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10):
     # alphas: (krylov_dim,), betas: (krylov_dim,)
     # V_final[0:krylov_dim] contains the orthonormal basis vectors
 
-    # Build real symmetric tridiagonal T
-    T = jnp.diag(alphas) + jnp.diag(betas[:-1], 1) + jnp.diag(betas[:-1], -1)
-
-    # Time propagation: exp(-i*dt*H) for RTE, exp(-dt*H) for ITE
-    if mctdh.imag_time:
-        expT = jax.scipy.linalg.expm(-dt * T)
-    else:
-        expT = jax.scipy.linalg.expm(-1j * dt * T)
-
-    e1 = jnp.zeros(krylov_dim, dtype=expT.dtype).at[0].set(1.0)
-    coeffs = expT @ e1
+    # Time propagation: exp(-i*dt*H) for RTE, exp(-dt*H) for ITE (T and
+    # expm in double, see _sil_expm_coeffs)
+    coeffs = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time, vec_dtype)
 
     # SIL Krylov truncation error (Saad bound), relative
     sil_error = jnp.abs(betas[-1] * coeffs[-1])
@@ -358,20 +368,12 @@ def _sil_solve_C_bidi(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10
         lanczos_step, init, jnp.arange(krylov_dim), length=krylov_dim
     )
 
-    T = jnp.diag(alphas) + jnp.diag(betas[:-1], 1) + jnp.diag(betas[:-1], -1)
-
-    # Diagonalize T and exponentiate eigenvalues for both directions
-    # Forward: exp(-i*dt*H) for RTE, exp(-dt*H) for ITE
-    if mctdh.imag_time:
-        expT_fwd = jax.scipy.linalg.expm(-dt * T)
-        expT_bwd = jax.scipy.linalg.expm(dt * T)
-    else:
-        expT_fwd = jax.scipy.linalg.expm(-1j * dt * T)
-        expT_bwd = jax.scipy.linalg.expm(1j * dt * T)
-
-    e1 = jnp.zeros(krylov_dim, dtype=expT_fwd.dtype).at[0].set(1.0)
-    coeffs_fwd = expT_fwd @ e1
-    coeffs_bwd = expT_bwd @ e1
+    # Both directions from the same T (T and expm in double, see
+    # _sil_expm_coeffs). Forward: exp(-i*dt*H) for RTE, exp(-dt*H) for ITE
+    coeffs_fwd = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time,
+                                  c_flat.dtype, sign=-1.0)
+    coeffs_bwd = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time,
+                                  c_flat.dtype, sign=+1.0)
 
     # SIL error from forward propagation
     sil_error = jnp.abs(betas[-1] * coeffs_fwd[-1])
@@ -518,15 +520,8 @@ def _sil_solve_bs(
             lanczos_step, init, jnp.arange(krylov_dim), length=krylov_dim
         )
 
-        T = jnp.diag(alphas) + jnp.diag(betas[:-1], 1) + jnp.diag(betas[:-1], -1)
-
-        if mctdh.imag_time:
-            expT = jax.scipy.linalg.expm(-dt * T)
-        else:
-            expT = jax.scipy.linalg.expm(-1j * dt * T)
-
-        e1 = jnp.zeros(krylov_dim, dtype=expT.dtype).at[0].set(1.0)
-        coeffs = expT @ e1
+        coeffs = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time,
+                                  b_flat.dtype)
 
         # SIL Krylov truncation error (Saad bound), relative
         sil_error_s = jnp.abs(betas[-1] * coeffs[-1])
