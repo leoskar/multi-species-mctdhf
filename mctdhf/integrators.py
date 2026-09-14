@@ -778,11 +778,11 @@ def _compute_density_quantities(mctdh, C):
     Returns (D_invs, ds) where D_invs is a list of inverse 1-RDMs per species
     and ds is a dict of state-averaged 2-RDMs.
     """
-    Ds = mctdh.dCI.get_1p_RDMs(C)
-    ds = mctdh.dCI.get_2p_RDMs(C)
-
-    Ds = [mctdh._state_average(D) for D in Ds]
-    ds = {k: mctdh._state_average(v) for k, v in ds.items()}
+    # Average over states inside the RDM build: exact (the excitation
+    # contraction is linear in ρ) and keeps the state axis out of it.
+    w = mctdh.state_weights
+    Ds = mctdh.dCI.get_1p_RDMs(C, weights=w)
+    ds = mctdh.dCI.get_2p_RDMs(C, weights=w)
 
     D_invs = []
     for s in range(mctdh.num_species):

@@ -19,6 +19,22 @@ from functools import partial
 from itertools import combinations
 
 
+def _segment_sum(data, ids, num_segments):
+    """``segment_sum`` that never scatters a complex operand.
+
+    XLA's GPU scatter codegen handles complex types badly: excessive per-thread
+    local memory at complex128, crashes at complex64. Summing real and
+    imaginary parts as one real scatter is exact, since segment_sum is linear.
+    """
+    if not jnp.iscomplexobj(data):
+        return jax.ops.segment_sum(
+            data, ids, num_segments=num_segments, indices_are_sorted=True)
+    stacked = jnp.stack([data.real, data.imag], axis=-1)
+    out = jax.ops.segment_sum(
+        stacked, ids, num_segments=num_segments, indices_are_sorted=True)
+    return (out[..., 0] + 1j * out[..., 1]).astype(data.dtype)
+
+
 class _SparseExc:
     """Nonzero entries of an excitation tensor E_{ij,o} in coordinate form.
 
@@ -102,9 +118,9 @@ class _SparseExc:
     def contract_orb(self, t):
         """Σ_o E_{ij,o} t_o  →  (n_dets, n_dets).  Gathers t, scatters on (i,j)."""
         contrib = self.val_d * t.reshape(-1)[self.orb_d]
-        return jax.ops.segment_sum(
-            contrib, self.det_d, num_segments=self.n_seg_det,
-            indices_are_sorted=True).reshape(self.n_dets, self.n_dets)
+        return _segment_sum(
+            contrib, self.det_d, self.n_seg_det).reshape(
+                self.n_dets, self.n_dets)
 
     def contract_det(self, rho):
         """Σ_ij E_{ij,o} rho_{...ij}  →  (..., n_orb^k).  Gathers rho, scatters on o.
@@ -114,9 +130,7 @@ class _SparseExc:
         rf = rho.reshape(rho.shape[:-2] + (self.n_dets * self.n_dets,))
         contrib = rf[..., self.det_o] * self.val_o
         moved = jnp.moveaxis(contrib, -1, 0)
-        out = jax.ops.segment_sum(
-            moved, self.orb_o, num_segments=self.n_seg_orb,
-            indices_are_sorted=True)
+        out = _segment_sum(moved, self.orb_o, self.n_seg_orb)
         return jnp.moveaxis(out, 0, -1)
 
 
@@ -566,14 +580,12 @@ class SemiDirectCI_n_species:
             n1, n2 = sp1.n_dets, sp2.n_dets
             m2 = sp2.n_orb
             g_sl = g_int[p_idx, :, r_idx, :]                     # (nnz1, m2, m2)
-            T1 = jax.ops.segment_sum(
-                sp1.val_d[:, None, None] * g_sl, sp1.det_d,
-                num_segments=n1 * n1, indices_are_sorted=True)   # (n1^2, m2, m2)
+            T1 = _segment_sum(sp1.val_d[:, None, None] * g_sl, sp1.det_d,
+                              n1 * n1)                           # (n1^2, m2, m2)
             #   Op_12 = contract("ijqs, klqs -> ijkl", T1, E_pq[s2])
             cols = T1.reshape(n1 * n1, m2 * m2)[:, sp2.orb_d]    # (n1^2, nnz2)
-            Op_12 = jax.ops.segment_sum(
-                (cols * sp2.val_d[None, :]).T, sp2.det_d,
-                num_segments=n2 * n2, indices_are_sorted=True)   # (n2^2, n1^2)
+            Op_12 = _segment_sum((cols * sp2.val_d[None, :]).T, sp2.det_d,
+                                 n2 * n2)                        # (n2^2, n1^2)
             Op_12 = Op_12.T.reshape(n1, n1, n2, n2)
             ops_pair[(s1, s2)] = factor * Op_12
 
@@ -635,35 +647,42 @@ class SemiDirectCI_n_species:
 
     # ── Reduced Density Matrices ──────────────────────────────────────────
 
-    def _compute_rho_ci(self, C, s):
+    def _compute_rho_ci(self, C, s, weights=None):
         """Compute the reduced CI density matrix for species s.
 
         Contracts C* and C over all species indices except s, yielding
         ρ^CI_{xy} = Σ_{other} C*_{...x...} C_{...y...}.
 
         Returns shape (..., n_det_s, n_det_s) where ... is the batch dimension.
+        With `weights`, the batch (state) axis is contracted against them here
+        instead, giving the state-averaged ρ directly with no batch axis.
         """
         c_indices = [chr(97 + i) for i in range(self.num_species)]
         c_conj_indices = list(c_indices)
         c_conj_indices[s] = "x"  # conjugate index
         c_indices[s] = "y"
 
+        if weights is not None:
+            rho_ci_str = (f"S,S{''.join(c_conj_indices)},"
+                          f"S{''.join(c_indices)}->xy")
+            return contract(rho_ci_str, weights, C.conj(), C, backend="jax")
         rho_ci_str = f"...{''.join(c_conj_indices)},...{''.join(c_indices)}->...xy"
         return contract(rho_ci_str, C.conj(), C, backend="jax")
 
     @partial(jit, static_argnums=0)
-    def get_1p_RDMs(self, C):
+    def get_1p_RDMs(self, C, weights=None):
         """Compute 1-particle reduced density matrices for all species.
 
         Returns
         -------
         list of jnp.ndarray
             D_s of shape (num_states, n_orb_s, n_orb_s) for each species s.
-            D^(s)_{pq} = ⟨Ψ| E^(s)_{pq} |Ψ⟩.
+            D^(s)_{pq} = ⟨Ψ| E^(s)_{pq} |Ψ⟩. With `weights`, the
+            state-averaged D_s of shape (n_orb_s, n_orb_s) instead.
         """
         Ds = []
         for s in range(self.num_species):
-            rho_ci = self._compute_rho_ci(C, s)
+            rho_ci = self._compute_rho_ci(C, s, weights)
             if self.sparse:
                 m = self.num_spatial_orbitals[s]
                 D_s = self._sp_pq[s].contract_det(rho_ci).reshape(
@@ -675,7 +694,7 @@ class SemiDirectCI_n_species:
         return Ds
 
     @partial(jit, static_argnums=0)
-    def get_2p_RDMs(self, C):
+    def get_2p_RDMs(self, C, weights=None):
         """Compute 2-particle reduced density matrices for all species pairs.
 
         Returns
@@ -683,12 +702,16 @@ class SemiDirectCI_n_species:
         dict of {(s1, s2): jnp.ndarray}
             d^(s1,s2)_{pqrs} = ⟨Ψ| E^(s1)_{pqrs} |Ψ⟩  (intra-species)
             d^(s1,s2)_{pqrs} = ⟨Ψ| E^(s1)_{pr} E^(s2)_{qs} |Ψ⟩  (inter-species)
+            With `weights`, the state-averaged RDMs, with no batch axis.
+
+        Averaging over states before the excitation contraction is exact (the
+        contraction is linear in ρ) and keeps the batch axis out of it.
         """
         ds = {}
 
         # Intra-species: reuse shared rho_ci helper
         for s1 in range(self.num_species):
-            rho_ci = self._compute_rho_ci(C, s1)
+            rho_ci = self._compute_rho_ci(C, s1, weights)
             if self.sparse:
                 m = self.num_spatial_orbitals[s1]
                 ds[(s1, s1)] = self._sp_pqrs[s1].contract_det(rho_ci).reshape(
@@ -710,10 +733,17 @@ class SemiDirectCI_n_species:
                 idx_conj[s1], idx_conj[s2] = "x", "z"
                 idx_norm[s1], idx_norm[s2] = "y", "w"
 
-                rho_pair_str = (
-                    f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
-                )
-                rho_pair = contract(rho_pair_str, C.conj(), C, backend="jax")
+                if weights is not None:
+                    rho_pair_str = (f"S,S{''.join(idx_conj)},"
+                                    f"S{''.join(idx_norm)}->xzyw")
+                    rho_pair = contract(rho_pair_str, weights, C.conj(), C,
+                                        backend="jax")
+                else:
+                    rho_pair_str = (
+                        f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
+                    )
+                    rho_pair = contract(rho_pair_str, C.conj(), C,
+                                        backend="jax")
 
                 # Sparse, in two segment_sums:
                 #   B[..., pr, zw] = sum_xy rho[..., xy, zw] E1[xy, pr]
@@ -731,15 +761,13 @@ class SemiDirectCI_n_species:
                 m1, m2 = sp1.n_orb, sp2.n_orb
                 rp = jnp.einsum("...xzyw->...xyzw", rho_pair).reshape(
                     rho_pair.shape[:-4] + (n1 * n1, n2 * n2))
-                B = jax.ops.segment_sum(
+                B = _segment_sum(
                     jnp.moveaxis(rp[..., sp1.det_o, :]
                                  * sp1.val_o[:, None], -2, 0),
-                    sp1.orb_o, num_segments=m1 * m1,
-                    indices_are_sorted=True)             # (m1^2, ..., n2^2)
-                d_pr_qs = jax.ops.segment_sum(
+                    sp1.orb_o, m1 * m1)                  # (m1^2, ..., n2^2)
+                d_pr_qs = _segment_sum(
                     jnp.moveaxis(B[..., sp2.det_o] * sp2.val_o, -1, 0),
-                    sp2.orb_o, num_segments=m2 * m2,
-                    indices_are_sorted=True)             # (m2^2, m1^2, ...)
+                    sp2.orb_o, m2 * m2)                  # (m2^2, m1^2, ...)
                 d_pr_qs = jnp.moveaxis(jnp.moveaxis(d_pr_qs, 0, -1), 0, -2)
                 d_inter = jnp.einsum(
                     "...prqs->...pqrs",
