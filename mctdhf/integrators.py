@@ -807,19 +807,108 @@ _C_KWARG_KEYS = {
     "sil": ("krylov_dim",),
     "diagonalize": (),
 }
-_B_KWARG_KEYS_CMF = {
-    "cn": ("solver_tol", "max_solver_iter"),
-    "sil": ("krylov_dim",),
-    "diagonalize": (),
-    "dop": ("n_substeps",),
-}
-_B_KWARG_KEYS_HALF = {
+# `n_orbital_substeps` sub-cycles the orbital step of either CMF integrator,
+# re-freezing the projector and the mean-field partner orbitals every
+# dt/n while the CI step stays at dt (see _solve_bs_subcycled).
+_B_KWARG_KEYS = {
     "cn": ("solver_tol", "max_solver_iter", "n_orbital_substeps"),
-    "sil": ("krylov_dim",),
-    "bs": ("bs_sequence",),
-    "diagonalize": ("orbital_x64",),
-    "dop": ("n_substeps",),
+    "sil": ("krylov_dim", "n_orbital_substeps"),
+    "bs": ("bs_sequence", "n_orbital_substeps"),
+    "diagonalize": ("orbital_x64", "n_orbital_substeps"),
+    "dop": ("n_substeps", "n_orbital_substeps"),
 }
+_B_KWARG_KEYS_CMF = _B_KWARG_KEYS
+_B_KWARG_KEYS_HALF = _B_KWARG_KEYS
+_B_PROPAGATORS = ("cn", "bs", "sil", "diagonalize", "dop")
+_C_PROPAGATORS = ("cn", "sil", "diagonalize")
+
+
+def _cmf_options(c_propagator, b_propagator, c_kwargs, b_kwargs):
+    """Validate and default the sub-solver options of both CMF integrators."""
+    if c_propagator not in _C_PROPAGATORS:
+        raise ValueError(
+            f"Unknown c_propagator '{c_propagator}'. Use one of {_C_PROPAGATORS}."
+        )
+    if b_propagator not in _B_PROPAGATORS:
+        raise ValueError(
+            f"Unknown b_propagator '{b_propagator}'. Use one of {_B_PROPAGATORS}."
+        )
+    c_kwargs = dict(c_kwargs or {})
+    b_kwargs = dict(b_kwargs or {})
+    _validate_kwargs(c_kwargs, _C_KWARG_KEYS[c_propagator], "c_kwargs", c_propagator)
+    _validate_kwargs(b_kwargs, _B_KWARG_KEYS[b_propagator], "b_kwargs", b_propagator)
+    c_opts = {
+        "solver_tol": c_kwargs.get("solver_tol", 1e-8),
+        "max_solver_iter": c_kwargs.get("max_solver_iter", 100),
+        "krylov_dim": c_kwargs.get("krylov_dim", 10),
+    }
+    b_opts = {
+        "solver_tol": b_kwargs.get("solver_tol", 1e-8),
+        "max_solver_iter": b_kwargs.get("max_solver_iter", 100),
+        "krylov_dim": b_kwargs.get("krylov_dim", 20),
+        "n_substeps": b_kwargs.get("n_substeps", 1),
+        "bs_sequence": b_kwargs.get("bs_sequence", (2, 4, 6, 8, 12, 16)),
+        "orbital_x64": b_kwargs.get("orbital_x64", False),
+        "n_orbital_substeps": int(b_kwargs.get("n_orbital_substeps", 1)),
+    }
+    return c_opts, b_opts
+
+
+def _solve_C(mctdh, c_propagator, C, h_MO_list, g_MO_dict, dt, c_shape, opts):
+    """One linearised CI substep (orbitals frozen) with the chosen propagator."""
+    if c_propagator == "sil":
+        return _sil_solve_C(
+            mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, opts["krylov_dim"]
+        )[0]
+    if c_propagator == "diagonalize":
+        return _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape)[0]
+    return _cn_solve_C(
+        mctdh, C, h_MO_list, g_MO_dict, dt, c_shape,
+        opts["solver_tol"], opts["max_solver_iter"],
+    )
+
+
+def _solve_bs(
+    mctdh, b_propagator, bs_start, h_current, D_invs, ds, bs_frozen, g2_frozen,
+    dt, b_shapes, opts,
+):
+    """One linearised orbital substep (projector, partner orbitals and density
+    matrices frozen) with the chosen propagator."""
+    args = (mctdh, bs_start, h_current, D_invs, ds, bs_frozen, g2_frozen, dt, b_shapes)
+    if b_propagator == "sil":
+        return _sil_solve_bs(*args, opts["krylov_dim"])[0]
+    if b_propagator == "diagonalize":
+        return _diag_solve_bs(*args, compute_x64=opts["orbital_x64"])[0]
+    if b_propagator == "dop":
+        return _dop_solve_bs(*args, opts["n_substeps"])[0]
+    if b_propagator == "bs":
+        return _bs_solve_bs(*args, opts["bs_sequence"])
+    return _cn_solve_bs(*args, opts["solver_tol"], opts["max_solver_iter"])
+
+
+def _solve_bs_subcycled(
+    mctdh, b_propagator, bs_start, h_current, D_invs, ds, dt, b_shapes, opts
+):
+    """Orbital step over dt in `n_orbital_substeps` substeps.
+
+    The density matrices stay frozen over the whole CMF step; the projector
+    (1-P) and the mean-field partner orbitals are re-frozen at the start of
+    every substep. On stiff orbital equations (weakly occupied orbitals, DVR
+    kinetic energy) the frozen projector is the dominant CMF error — measured
+    on the four-well N=3 system the whole-step error depends only on
+    dt/n_orbital_substeps, not on how the CI step is coupled — so this buys
+    a larger CI step for the cost of extra orbital solves, which are cheap
+    when the CI block dominates. n = 1 is the plain frozen-projector substep.
+    """
+    n_sub = opts["n_orbital_substeps"]
+    bs = bs_start
+    for _ in range(n_sub):
+        g2 = mctdh._precompute_frozen_g2(bs)
+        bs = _solve_bs(
+            mctdh, b_propagator, bs, h_current, D_invs, ds, bs, g2,
+            dt / n_sub, b_shapes, opts,
+        )
+    return bs
 
 
 def get_cmf_integrator(
@@ -830,7 +919,7 @@ def get_cmf_integrator(
     c_kwargs=None,
     b_kwargs=None,
 ):
-    """Constant Mean Field (CMF) integrator.
+    """Constant Mean Field (CMF) integrator, first-order (Lie-Trotter) split.
 
     Decouples CI and orbital propagation. Each sub-problem becomes linear
     in its own variable with the other frozen, and any of CN/SIL/
@@ -840,8 +929,9 @@ def get_cmf_integrator(
     the decoupled sub-problems are genuinely linear and can be solved
     to machine precision.
 
-    Best suited for imaginary time evolution (ITE) where the dissipative
-    dynamics are tolerant of the first-order CMF splitting error.
+    Step: CI over dt with the integrals at b(t) (one-body operator at
+    t+dt/2), then the orbitals over dt with the density matrices from
+    C(t+dt). See get_cmf_half_step_integrator for the second-order layout.
 
     Args:
         mctdh: MCTDHF_n_species instance.
@@ -856,12 +946,13 @@ def get_cmf_integrator(
                             is small.
         b_propagator: Sub-integrator for orbitals. One of:
             'cn'          - Crank-Nicolson with BiCGSTAB (default)
-            'sil'         - Short Iterative Lanczos. Recommended for large
-                            DVR grids where dt * max(h) >> 1.
+            'sil'         - Short Iterative Lanczos. Assumes a Hermitian
+                            generator, which the (1-P)(h+W)D⁻¹ gauge is not.
             'diagonalize' - Dense matrix exponential of A_s (the linearised
                             substep operator). Exact in the linearised
-                            ODE. Cheap when n_spatial · n_orb is small
-                            (≲ a few hundred per species). Autodiff-clean.
+                            ODE. Cheap when n_spatial · n_orb is small.
+            'dop'         - fixed-step Dormand-Prince 5(4)
+            'bs'          - Bulirsch-Stoer (modified midpoint + Richardson)
         c_kwargs: Dict of solver-specific options for the chosen
             c_propagator. Recognised keys (defaults in parens):
               cn:           solver_tol (1e-8), max_solver_iter (100)
@@ -871,36 +962,17 @@ def get_cmf_integrator(
             b_propagator. Recognised keys (defaults in parens):
               cn:           solver_tol (1e-8), max_solver_iter (100)
               sil:          krylov_dim (20)
-              diagonalize:  (none)
+              diagonalize:  orbital_x64 (False)
+              dop:          n_substeps (1)
+              bs:           bs_sequence ((2,4,6,8,12,16))
+              all:          n_orbital_substeps (1) — sub-cycle the orbital
+                            step with the projector re-frozen every dt/n
+                            (see _solve_bs_subcycled)
 
     Returns:
         integrate: Function integrate(t, y) -> (t_new, y_new).
     """
-    if c_propagator not in ("cn", "sil", "diagonalize"):
-        raise ValueError(
-            f"Unknown c_propagator '{c_propagator}'. "
-            f"Use 'cn', 'sil', or 'diagonalize'."
-        )
-    if b_propagator not in ("cn", "sil", "diagonalize", "dop"):
-        raise ValueError(
-            f"Unknown b_propagator '{b_propagator}'. "
-            f"Use 'cn', 'sil', or 'diagonalize'."
-        )
-
-    c_kwargs = dict(c_kwargs or {})
-    b_kwargs = dict(b_kwargs or {})
-    _validate_kwargs(c_kwargs, _C_KWARG_KEYS[c_propagator], "c_kwargs", c_propagator)
-    _validate_kwargs(b_kwargs, _B_KWARG_KEYS_CMF[b_propagator], "b_kwargs", b_propagator)
-
-    c_solver_tol = c_kwargs.get("solver_tol", 1e-8)
-    c_max_iter = c_kwargs.get("max_solver_iter", 100)
-    c_krylov_dim = c_kwargs.get("krylov_dim", 10)
-
-    b_solver_tol = b_kwargs.get("solver_tol", 1e-8)
-    b_max_iter = b_kwargs.get("max_solver_iter", 100)
-    b_krylov_dim = b_kwargs.get("krylov_dim", 20)
-    b_n_substeps = b_kwargs.get("n_substeps", 1)
-
+    c_opts, b_opts = _cmf_options(c_propagator, b_propagator, c_kwargs, b_kwargs)
     c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
     b_shapes = [
         (mctdh.num_spatial_orbitals[s], mctdh.num_mctdhf_orbitals[s])
@@ -919,77 +991,16 @@ def get_cmf_integrator(
         g_MO_dict, _ = mctdh._transform_all_g(bs, full=False)
 
         # 2. Solve CI (orbitals frozen)
-        if c_propagator == "sil":
-            C_new, _ = _sil_solve_C(
-                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, c_krylov_dim
-            )
-        elif c_propagator == "diagonalize":
-            C_new, _ = _diag_solve_C(
-                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape
-            )
-        else:
-            C_new = _cn_solve_C(
-                mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, c_solver_tol, c_max_iter
-            )
+        C_new = _solve_C(mctdh, c_propagator, C, h_MO_list, g_MO_dict, dt,
+                         c_shape, c_opts)
 
         # 3. Update density matrices from new C
         D_invs, ds = _compute_density_quantities(mctdh, C_new)
 
-        # 4. Solve orbitals per species (frozen projector taken from bs).
-        # The frozen-tau g_2 half-transform is invariant across the solve.
-        g2_frozen = mctdh._precompute_frozen_g2(bs)
-        if b_propagator == "sil":
-            bs_new, _ = _sil_solve_bs(
-                mctdh,
-                bs,
-                h_current,
-                D_invs,
-                ds,
-                bs,
-                g2_frozen,
-                dt,
-                b_shapes,
-                b_krylov_dim,
-            )
-        elif b_propagator == "diagonalize":
-            bs_new, _ = _diag_solve_bs(
-                mctdh,
-                bs,
-                h_current,
-                D_invs,
-                ds,
-                bs,
-                g2_frozen,
-                dt,
-                b_shapes,
-            )
-        elif b_propagator == "dop":
-            bs_new, _ = _dop_solve_bs(
-                mctdh,
-                bs,
-                h_current,
-                D_invs,
-                ds,
-                bs,
-                g2_frozen,
-                dt,
-                b_shapes,
-                b_n_substeps,
-            )
-        else:
-            bs_new = _cn_solve_bs(
-                mctdh,
-                bs,
-                h_current,
-                D_invs,
-                ds,
-                bs,
-                g2_frozen,
-                dt,
-                b_shapes,
-                b_solver_tol,
-                b_max_iter,
-            )
+        # 4. Solve orbitals (projector frozen from bs, re-frozen per substep)
+        bs_new = _solve_bs_subcycled(
+            mctdh, b_propagator, bs, h_current, D_invs, ds, dt, b_shapes, b_opts
+        )
 
         return t + dt, mctdh._Cb_to_y(C_new, bs_new)
 
@@ -1018,6 +1029,11 @@ def get_cmf_half_step_integrator(
 
     This doubles the computational cost per step compared to basic CMF,
     but typically allows 5-10× larger dt in RTE, for a net speedup.
+
+    Caution: the corrector freezes the projector and mean field at the
+    PREDICTED b(t+dt/2). On stiff orbital equations (DVR grids, four-well
+    N=3 record 2026-09-14) that feedback is a linear instability at every dt;
+    get_cmf_midpoint_integrator is the same layout without the predictor.
 
     Args:
         mctdh: MCTDHF_n_species instance.
@@ -1313,6 +1329,82 @@ def get_cmf_half_step_integrator(
                 c_solver_tol,
                 c_max_iter,
             )
+
+        return t + dt, mctdh._Cb_to_y(C_new, bs_new)
+
+    return integrate
+
+
+
+def get_cmf_midpoint_integrator(
+    mctdh,
+    dt,
+    c_propagator="cn",
+    b_propagator="cn",
+    c_kwargs=None,
+    b_kwargs=None,
+):
+    """Second-order (midpoint) CMF integrator.
+
+    Algorithm (the Beck-Meyer second-order CMF layout):
+        1. CI half-step C(t) -> C(t+dt/2) with the integrals at b(t)
+        2. Orbital full step b(t) -> b(t+dt) with the density matrices from
+           C(t+dt/2) and the one-body operator at t+dt/2; projector and
+           mean-field partner orbitals frozen at b(t) (sub-cycled if
+           n_orbital_substeps > 1)
+        3. CI half-step C(t+dt/2) -> C(t+dt) with the integrals at b(t+dt)
+
+    Unlike get_cmf_half_step_integrator there is NO orbital predictor: that
+    integrator freezes the projector and mean field at a predicted b(t+dt/2),
+    and feeding a predicted orbital back through (1-P) with the stiff one-body
+    operator is a linear instability at every dt (four-well N=3 record,
+    2026-09-14). Cost: two CI half-steps and one orbital step, i.e. ~2x the
+    basic integrator when the CI step dominates.
+
+    Args: as get_cmf_integrator.
+
+    Returns:
+        integrate: Function integrate(t, y) -> (t_new, y_new).
+    """
+    c_opts, b_opts = _cmf_options(c_propagator, b_propagator, c_kwargs, b_kwargs)
+    c_shape = (mctdh.num_states,) + tuple(mctdh.num_dets)
+    b_shapes = [
+        (mctdh.num_spatial_orbitals[s], mctdh.num_mctdhf_orbitals[s])
+        for s in range(mctdh.num_species)
+    ]
+    dt_half = dt / 2
+
+    @jax.jit
+    def integrate(t, y):
+        C, bs = mctdh._y_to_Cb(y)
+
+        # 1. CI half-step with the integrals at b(t)
+        h_current_t = mctdh._get_h_current(t)
+        h_MO_list_t = [
+            mctdh.transform_h(h_current_t[s], bs[s])[1]
+            for s in range(mctdh.num_species)
+        ]
+        g_MO_dict_t, _ = mctdh._transform_all_g(bs, full=False)
+        C_half = _solve_C(mctdh, c_propagator, C, h_MO_list_t, g_MO_dict_t,
+                          dt_half, c_shape, c_opts)
+
+        # 2. Orbital full step: midpoint density matrices, projector at b(t)
+        D_invs_half, ds_half = _compute_density_quantities(mctdh, C_half)
+        h_current_half = mctdh._get_h_current(t + dt_half)
+        bs_new = _solve_bs_subcycled(
+            mctdh, b_propagator, bs, h_current_half, D_invs_half, ds_half, dt,
+            b_shapes, b_opts,
+        )
+
+        # 3. CI half-step with the integrals at b(t+dt)
+        h_current_new = mctdh._get_h_current(t + dt)
+        h_MO_list_new = [
+            mctdh.transform_h(h_current_new[s], bs_new[s])[1]
+            for s in range(mctdh.num_species)
+        ]
+        g_MO_dict_new, _ = mctdh._transform_all_g(bs_new, full=False)
+        C_new = _solve_C(mctdh, c_propagator, C_half, h_MO_list_new,
+                         g_MO_dict_new, dt_half, c_shape, c_opts)
 
         return t + dt, mctdh._Cb_to_y(C_new, bs_new)
 
