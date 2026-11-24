@@ -142,6 +142,207 @@ def get_rk4_solver(rhs, dt):
     return integrate
 
 
+# ── Generic single-block kernels ──────────────────────────────────────────
+#
+# Every CMF sub-solver below is the same handful of linear-ODE propagators
+# applied to one block of the state (the CI tensor, one species' orbital
+# matrix, and — in ML-MCTDHF — one species' SPF matrix). The propagators are
+# factored out here so the ML integrators reuse them verbatim rather than
+# growing a second copy; the sub-solvers are thin loops over these.
+#
+# Each kernel takes the block's linear RHS as a callable and the block itself,
+# and returns the propagated block with the same shape and dtype.
+
+
+def _cn_linear(rhs_fn, x0, dt, tol, maxiter):
+    """Crank–Nicolson step of the linear ODE ``ẋ = rhs_fn(x)``.
+
+    Solves ``x - dt/2 · rhs_fn(x) = x0 + dt/2 · rhs_fn(x0)`` with BiCGSTAB,
+    starting from the explicit-Euler guess ``x0 + dt · rhs_fn(x0)``.
+
+    Not unitary when the generator is non-Hermitian (the Cayley map only is
+    for skew-Hermitian generators), so the caller owns re-gauging.
+    """
+    shape = x0.shape
+    dot_0 = rhs_fn(x0)
+    b_vec = x0 + (dt / 2) * dot_0
+
+    def matvec(x_flat):
+        x = x_flat.reshape(shape)
+        fx = rhs_fn(x)
+        return (x - (dt / 2) * fx).reshape(-1)
+
+    guess = (x0 + dt * dot_0).reshape(-1)
+    x_new_flat, _ = jax.scipy.sparse.linalg.bicgstab(
+        matvec,
+        b_vec.reshape(-1),
+        x0=guess,
+        tol=tol,
+        maxiter=maxiter,
+    )
+    return x_new_flat.reshape(shape)
+
+
+def _lower(tree):
+    """complex128 -> complex64 and float64 -> float32 on every leaf; integer
+    leaves (index tables) and non-array leaves pass through.
+
+    Same as ``MLMCTDHF_n_species_ITE_opt._lower``.
+    """
+    def cast(x):
+        if not hasattr(x, "dtype"):
+            return x
+        if x.dtype == jnp.complex128:
+            return x.astype(jnp.complex64)
+        if x.dtype == jnp.float64:
+            return x.astype(jnp.float32)
+        return x
+    return jax.tree_util.tree_map(cast, tree)
+
+
+def _cn_defect_linear(rhs_hi, rhs_lo, x0, dt, tol, maxiter, lo_dtype,
+                      project=None):
+    """Mixed-precision Crank–Nicolson step of ``ẋ = rhs_fn(x)``, defect form.
+
+    ``x1 = x0 + d`` with ``(I - dt/2 · L_lo) d = dt · L_hi x0``: algebraically
+    ``_cn_linear``'s ``(I - dt/2 L) x1 = (I + dt/2 L) x0``, written for the
+    increment so the residual (``rhs_hi``, at ``x0.dtype``) and the BiCGSTAB
+    solve (``rhs_lo``, at ``lo_dtype``) can run at different precisions.
+    Same as ``MLMCTDHF_n_species_ITE_opt._cn_defect``.
+
+    Like ``_cn_linear``, the sign convention (``-A·x`` in ITE, ``-i·A·x`` in
+    RTE) lives in the RHS callables, so real and imaginary time go through
+    the same code. The inner ``tol`` is relative to ``d``: in imaginary time
+    ``d → 0`` at a fixed point and the tolerance only sets the rate; in real
+    time ``d`` is ``O(dt)`` every step, so the per-step error is roughly
+    ``max(tol, eps(lo_dtype)) · |d|``.
+
+    Trace-time guards, because a silent promotion would make "mixed" x64
+    under another name (one float64 leaf left in the frozen operators
+    promotes every matvec back to complex128), and a non-lower ``lo_dtype``
+    would make it a slower copy of ``_cn_linear``:
+
+    * ``lo_dtype`` must be strictly narrower than ``x0.dtype``;
+    * ``rhs_hi`` must return ``x0.dtype``;
+    * ``rhs_lo`` and the solver matvec must return ``lo_dtype``.
+
+    ``project`` (optional, applied to ``d`` at the state precision) is the
+    frozen ``(1 - P_f)``. The exact CN increment lies in its range, since
+    every term of the orbital and SPF RHS does; the low-precision solve
+    applies ``P_f`` only to ``eps(lo_dtype)`` relative accuracy, and with a
+    stiff frozen operator (``D^-1`` ~ 1/eps on weakly occupied orbitals) that
+    leaks an in-span component into ``d`` which breaks orthonormality at
+    FIRST order and compounds step to step (measured on the four-well MF
+    layout: the active orbitals' ``|b^dagger b - 1|`` grew 3-5x per step and
+    reached NaN within 10 steps). Re-projecting ``d`` with the high-precision
+    projector restores the exact structure; unlike a trailing
+    orthonormalisation it does not touch the in-span part of the state.
+    """
+    shape = x0.shape
+    lo_dtype = jnp.dtype(lo_dtype)
+    if lo_dtype.itemsize >= x0.dtype.itemsize:
+        raise TypeError(f"lo_dtype {lo_dtype} is not lower precision than "
+                        f"the state dtype {x0.dtype}")
+    probe_hi = jax.eval_shape(rhs_hi, jax.ShapeDtypeStruct(shape, x0.dtype))
+    if probe_hi.dtype != x0.dtype:
+        raise TypeError(f"high-precision RHS returns {probe_hi.dtype}, "
+                        f"expected {x0.dtype}")
+    probe = jax.eval_shape(rhs_lo, jax.ShapeDtypeStruct(shape, lo_dtype))
+    if probe.dtype != lo_dtype:
+        raise TypeError(f"low-precision RHS returns {probe.dtype}, "
+                        f"expected {lo_dtype}")
+    r = dt * rhs_hi(x0)
+
+    def matvec(d_flat):
+        d = d_flat.reshape(shape)
+        return (d - (dt / 2) * rhs_lo(d)).reshape(-1)
+
+    probe_mv = jax.eval_shape(matvec, jax.ShapeDtypeStruct((x0.size,), lo_dtype))
+    if probe_mv.dtype != lo_dtype:
+        raise TypeError(f"low-precision matvec returns {probe_mv.dtype}, "
+                        f"expected {lo_dtype} (is dt a float64 array?)")
+
+    r_lo = r.astype(lo_dtype).reshape(-1)
+    d_flat, _ = jax.scipy.sparse.linalg.bicgstab(
+        matvec, r_lo, x0=r_lo, tol=tol, maxiter=maxiter)
+    d = d_flat.reshape(shape).astype(x0.dtype)
+    if project is not None:
+        d = project(d)
+    return x0 + d
+
+
+def _expm_dense_linear(rhs_fn, x0, dt, imag_time, compute_x64=False):
+    """Exact step of ``ẋ = rhs_fn(x)`` via a dense matrix exponential.
+
+    ``rhs_fn`` is assumed linear in ``x`` and to carry the solver's sign
+    convention, i.e. it returns ``-A·x`` (ITE) or ``-i·A·x`` (RTE). The dense
+    generator is built by ``vmap``-ing ``rhs_fn`` over the standard basis of
+    the flattened block, then ``expm`` is applied to ``x0``.
+
+    ``compute_x64`` promotes only the precision-critical part — the
+    non-Hermitian ``expm`` and its application — to complex128, leaving the
+    (much larger) basis-vector build in the native bulk dtype.
+
+    Exact in the linearised substep; cost is ``prod(x0.shape)`` RHS
+    evaluations plus one dense ``expm``, so it is the right choice only while
+    that dimension is small (a few hundred).
+    """
+    shape = x0.shape
+    x_flat = x0.reshape(-1)
+    n = x_flat.shape[0]
+
+    def apply_once(x):
+        return rhs_fn(x).reshape(-1)
+
+    I_cols = jnp.eye(n, dtype=x0.dtype).reshape((n,) + shape)
+    J_rows = jax.vmap(apply_once)(I_cols)   # row k = J · e_k
+    J_mat = J_rows.T                         # columns = J · e_k → J as matrix
+
+    # Extract A from the rhs sign convention; form the expm argument.
+    if imag_time:
+        arg = -dt * (-J_mat)
+    else:
+        arg = -1j * dt * (1j * J_mat)
+
+    if compute_x64:
+        expA = jax.scipy.linalg.expm(arg.astype(jnp.complex128))
+        x_new_flat = expA @ x_flat.astype(jnp.complex128)
+    else:
+        expA = jax.scipy.linalg.expm(arg)
+        x_new_flat = expA @ x_flat
+
+    return x_new_flat.reshape(shape).astype(x0.dtype)
+
+
+def _dop_linear(rhs_fn, x0, dt, n_substeps=1):
+    """Fixed-step Dormand–Prince 5(4) step of ``ẋ = rhs_fn(x)``.
+
+    The CMF sub-problems have a FROZEN generator over the substep, so they
+    are autonomous linear ODEs — the case an explicit Runge–Kutta method
+    handles best. Makes no Hermiticity assumption, builds no matrix and
+    solves no linear system; being explicit it is stability-limited by
+    ``dt · ρ(A) ≲ 3``, which ``n_substeps`` relieves.
+    """
+    h = dt / n_substeps
+
+    def one_substep(x, _):
+        ks = []
+        for i in range(7):
+            xi = x
+            for j, aij in enumerate(_DP_A[i]):
+                if aij != 0.0:
+                    xi = xi + h * aij * ks[j]
+            ks.append(rhs_fn(xi))
+        out = x
+        for coef, k in zip(_DP_B5, ks):
+            if coef != 0.0:
+                out = out + h * coef * k
+        return out, None
+
+    x_out, _ = jax.lax.scan(one_substep, x0, None, length=n_substeps)
+    return x_out
+
+
 def _cn_solve_C(
     mctdh, C, h_MO_list, g_MO_dict, dt_sub, c_shape, solver_tol, max_solver_iter
 ):
@@ -158,23 +359,7 @@ def _cn_solve_C(
         sigma = mctdh.dCI.apply_ci_ops(ops, x)
         return -sigma if mctdh.imag_time else -1j * sigma
 
-    C_dot_0 = rhs_C(C)
-    b_vec = C + (dt_sub / 2) * C_dot_0
-
-    def matvec(x_flat):
-        x = x_flat.reshape(c_shape)
-        fx = rhs_C(x)
-        return (x - (dt_sub / 2) * fx).reshape(-1)
-
-    x0 = (C + dt_sub * C_dot_0).reshape(-1)
-    C_new_flat, _ = jax.scipy.sparse.linalg.bicgstab(
-        matvec,
-        b_vec.reshape(-1),
-        x0=x0,
-        tol=solver_tol,
-        maxiter=max_solver_iter,
-    )
-    return C_new_flat.reshape(c_shape)
+    return _cn_linear(rhs_C, C, dt_sub, solver_tol, max_solver_iter)
 
 
 def _cn_solve_bs(
@@ -197,29 +382,57 @@ def _cn_solve_bs(
     """
     bs_new = list(bs_start)
     for s in range(mctdh.num_species):
-        b_s = bs_start[s]
 
-        b_dot_0 = mctdh._rhs_b_linear(
-            b_s, s, h_current[s], D_invs[s], ds, bs_frozen, g2_frozen
-        )
-        b_vec = b_s + (dt_sub / 2) * b_dot_0
-
-        def matvec(x_flat, _s=s):
-            x = x_flat.reshape(b_shapes[_s])
-            fx = mctdh._rhs_b_linear(
+        def rhs_b(x, _s=s):
+            return mctdh._rhs_b_linear(
                 x, _s, h_current[_s], D_invs[_s], ds, bs_frozen, g2_frozen
             )
-            return (x - (dt_sub / 2) * fx).reshape(-1)
 
-        x0 = (b_s + dt_sub * b_dot_0).reshape(-1)
-        b_new_flat, _ = jax.scipy.sparse.linalg.bicgstab(
-            matvec,
-            b_vec.reshape(-1),
-            x0=x0,
-            tol=solver_tol,
-            maxiter=max_solver_iter,
+        bs_new[s] = _cn_linear(
+            rhs_b, bs_start[s], dt_sub, solver_tol, max_solver_iter
         )
-        bs_new[s] = b_new_flat.reshape(b_shapes[s])
+    return bs_new
+
+
+def _cn_mixed_solve_bs(
+    mctdh,
+    bs_start,
+    h_current,
+    D_invs,
+    ds,
+    bs_frozen,
+    g2_frozen,
+    dt_sub,
+    b_shapes,
+    solver_tol,
+    max_solver_iter,
+    lo_dtype,
+):
+    """Mixed-precision (defect-form) CN solve of all orbital sub-problems.
+
+    As ``_cn_solve_bs``, with the residual at the state precision and the
+    BiCGSTAB solve on the frozen tuple ``(h, D_inv, ds, bs, g2)`` lowered to
+    ``lo_dtype`` (``_cn_defect_linear``). No trailing orthonormalisation: in
+    real time that is not gauge-exact; the caller owns re-gauging.
+    """
+    bs_new = list(bs_start)
+    for s in range(mctdh.num_species):
+        frozen = (h_current[s], D_invs[s], ds, bs_frozen, g2_frozen)
+        frozen_lo = _lower(frozen)
+
+        def rhs_hi(x, _s=s, _f=frozen):
+            return mctdh._rhs_b_linear(x, _s, *_f)
+
+        def rhs_lo(x, _s=s, _f=frozen_lo):
+            return mctdh._rhs_b_linear(x, _s, *_f)
+
+        def project(X, _bf=bs_frozen[s]):
+            return X - _bf @ (_bf.conj().T @ X)
+
+        bs_new[s] = _cn_defect_linear(
+            rhs_hi, rhs_lo, bs_start[s], dt_sub, solver_tol, max_solver_iter,
+            lo_dtype, project=project,
+        )
     return bs_new
 
 
@@ -228,7 +441,7 @@ def _sil_expm_coeffs(alphas, betas, dt, imag_time, vec_dtype, sign=-1.0):
     Lanczos tridiagonal. T and the exponential are formed in double regardless
     of the vector dtype: in complex64 the k x k expm is non-unitary by ~5e-7
     per step, a norm bias that dominates the CI propagation at large CI blocks
-    (Part_2 record, 2026-09-14). The coefficients are cast back to `vec_dtype`
+    (measured on the three-electron four-well system). The coefficients are cast back to `vec_dtype`
     for the reconstruction with the stored basis."""
     f64 = jax.dtypes.canonicalize_dtype(jnp.float64)
     a = alphas.astype(f64)
@@ -239,6 +452,110 @@ def _sil_expm_coeffs(alphas, betas, dt, imag_time, vec_dtype, sign=-1.0):
     else:
         expT = jax.scipy.linalg.expm(sign * 1j * dt * T)
     return expT[:, 0].astype(vec_dtype)
+
+
+def _lanczos_basis(apply_H, v0, krylov_dim):
+    """Lanczos recursion with full re-orthogonalization.
+
+    Returns ``(V, alphas, betas)``: the orthonormal Krylov basis as a
+    ``(krylov_dim, dim)`` matrix and the tridiagonal coefficients.
+
+    ``V`` is carried in the scan state so each step can orthogonalize against
+    every previously computed basis vector — essential in float32, where
+    classical Lanczos loses orthogonality within a few iterations. Rows beyond
+    the current step are still zero, so their dot products vanish and no
+    masking is needed.
+    """
+    dim = v0.shape[0]
+    vec_dtype = v0.dtype
+    real_dtype = v0.real.dtype
+    V_init = jnp.zeros((krylov_dim, dim), dtype=vec_dtype)
+
+    def lanczos_step(carry, j):
+        V, v_prev, v_curr, beta_prev = carry
+        # Store v_curr as basis vector j (at step start, not end,
+        # to avoid overwriting row 0 on the last iteration)
+        V = V.at[j].set(v_curr)
+        w = apply_H(v_curr).astype(vec_dtype)
+        alpha = jnp.real(jnp.dot(v_curr.conj(), w)).astype(real_dtype)
+        w = w - alpha * v_curr - beta_prev * v_prev
+        overlaps = jnp.dot(V.conj(), w)  # (krylov_dim,)
+        w = w - jnp.dot(overlaps, V)  # (dim,)
+        beta = jnp.sqrt(jnp.real(jnp.dot(w.conj(), w))).astype(real_dtype)
+        safe_beta = jnp.where(beta > 1e-15, beta, 1.0)
+        v_next = w / safe_beta
+        return (V, v_curr, v_next, beta), (alpha, beta)
+
+    init = (V_init, jnp.zeros_like(v0), v0, jnp.array(0.0, dtype=real_dtype))
+    (V_final, _, _, _), (alphas, betas) = jax.lax.scan(
+        lanczos_step, init, jnp.arange(krylov_dim), length=krylov_dim
+    )
+    return V_final, alphas, betas
+
+
+def _lanczos_expm(apply_H, v_flat, dt, imag_time, krylov_dim=10, sign=-1.0):
+    """Short Iterative Lanczos (SIL) propagation of one flat block.
+
+    Computes ``exp(sign·i·dt·H)·v`` (RTE) / ``exp(sign·dt·H)·v`` (ITE) by
+    building a Krylov subspace with :func:`_lanczos_basis` and exponentiating
+    the small tridiagonal matrix.
+
+    ``apply_H`` maps a flat vector to a flat vector and must be the HERMITIAN
+    generator, not the signed RHS: callers extract it from ``_rhs_*_linear``
+    by negating (ITE) or multiplying by ``1j`` (RTE).
+
+    Returns ``(v_new, sil_error)`` with ``sil_error`` the relative Saad bound
+    ``|beta_last · coeff_last|``.
+    """
+    norm_v = jnp.linalg.norm(v_flat)
+    safe_norm = jnp.where(norm_v > 0, norm_v, 1.0)
+    v0 = v_flat / safe_norm
+
+    V_final, alphas, betas = _lanczos_basis(apply_H, v0, krylov_dim)
+
+    # T and the exponential are formed in double regardless of vector dtype
+    # (see _sil_expm_coeffs).
+    coeffs = _sil_expm_coeffs(alphas, betas, dt, imag_time, v_flat.dtype,
+                              sign=sign)
+
+    # SIL Krylov truncation error (Saad bound), relative
+    sil_error = jnp.abs(betas[-1] * coeffs[-1])
+
+    # Reconstruct: v_new = ||v|| * V^T @ coeffs (V is orthonormal)
+    v_new = safe_norm * jnp.dot(coeffs, V_final)
+    v_new = jnp.where(norm_v > 0, v_new, v_flat)
+    return v_new, sil_error
+
+
+def _lanczos_expm_bidi(apply_H, v_flat, dt, imag_time, krylov_dim=10):
+    """Forward and backward SIL propagation from ONE Lanczos decomposition.
+
+    Returns ``(v_fwd, v_bwd, sil_error_fwd)`` where ``v_fwd`` uses
+    ``sign = -1`` and ``v_bwd`` uses ``sign = +1``. The extra cost over
+    :func:`_lanczos_expm` is one additional small ``krylov_dim²`` matrix
+    exponential; the backward vector is what the adaptive integrator compares
+    against the input to estimate the CMF splitting error.
+    """
+    norm_v = jnp.linalg.norm(v_flat)
+    safe_norm = jnp.where(norm_v > 0, norm_v, 1.0)
+    v0 = v_flat / safe_norm
+
+    V_final, alphas, betas = _lanczos_basis(apply_H, v0, krylov_dim)
+
+    coeffs_fwd = _sil_expm_coeffs(alphas, betas, dt, imag_time,
+                                  v_flat.dtype, sign=-1.0)
+    coeffs_bwd = _sil_expm_coeffs(alphas, betas, dt, imag_time,
+                                  v_flat.dtype, sign=+1.0)
+
+    sil_error = jnp.abs(betas[-1] * coeffs_fwd[-1])
+
+    v_fwd = safe_norm * jnp.dot(coeffs_fwd, V_final)
+    v_fwd = jnp.where(norm_v > 0, v_fwd, v_flat)
+
+    v_bwd = safe_norm * jnp.dot(coeffs_bwd, V_final)
+    v_bwd = jnp.where(norm_v > 0, v_bwd, v_flat)
+
+    return v_fwd, v_bwd, sil_error
 
 
 def _sil_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10):
@@ -256,11 +573,6 @@ def _sil_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10):
     Uses full re-orthogonalization (V carried in scan state) for numerical
     stability in float32/complex64 arithmetic.
     """
-    c_flat = C.reshape(-1)
-    dim = c_flat.shape[0]
-    norm_c = jnp.linalg.norm(c_flat)
-    safe_norm = jnp.where(norm_c > 0, norm_c, 1.0)
-
     # Integrals are frozen across the Lanczos recursion: precontract them
     # with the excitation tensors once (E_pq·h, E_pqrs·g, T1/Op_12) so each
     # Lanczos step only applies the small determinant-space operators.
@@ -271,55 +583,9 @@ def _sil_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10):
     def apply_H(v_flat):
         return mctdh.dCI.apply_ci_ops(ops, v_flat.reshape(c_shape)).reshape(-1)
 
-    v0 = c_flat / safe_norm
-
-    # Lanczos iteration via lax.scan with full re-orthogonalization.
-    # V is carried in the scan state so that at each step we can
-    # orthogonalize against all previously computed basis vectors.
-    # This is essential for float32 where classical Lanczos loses
-    # orthogonality within a few iterations.
-    V_init = jnp.zeros((krylov_dim, dim), dtype=c_flat.dtype)
-
-    vec_dtype = c_flat.dtype
-    real_dtype = c_flat.real.dtype
-
-    def lanczos_step(carry, j):
-        V, v_prev, v_curr, beta_prev = carry
-        # Store v_curr as basis vector j (at step start, not end,
-        # to avoid overwriting row 0 on the last iteration)
-        V = V.at[j].set(v_curr)
-        w = apply_H(v_curr).astype(vec_dtype)
-        alpha = jnp.real(jnp.dot(v_curr.conj(), w)).astype(real_dtype)
-        w = w - alpha * v_curr - beta_prev * v_prev
-        # Full re-orthogonalization against all stored basis vectors.
-        # Rows beyond j are zero so the dot products vanish — no
-        # masking needed, and the matmul is on a small (krylov_dim, dim)
-        # matrix which stays in GPU cache.
-        overlaps = jnp.dot(V.conj(), w)  # (krylov_dim,)
-        w = w - jnp.dot(overlaps, V)  # (dim,)
-        beta = jnp.sqrt(jnp.real(jnp.dot(w.conj(), w))).astype(real_dtype)
-        safe_beta = jnp.where(beta > 1e-15, beta, 1.0)
-        v_next = w / safe_beta
-        return (V, v_curr, v_next, beta), (alpha, beta)
-
-    init = (V_init, jnp.zeros_like(v0), v0, jnp.array(0.0, dtype=real_dtype))
-    (V_final, _, _, _), (alphas, betas) = jax.lax.scan(
-        lanczos_step, init, jnp.arange(krylov_dim), length=krylov_dim
+    c_new_flat, sil_error = _lanczos_expm(
+        apply_H, C.reshape(-1), dt, mctdh.imag_time, krylov_dim
     )
-    # alphas: (krylov_dim,), betas: (krylov_dim,)
-    # V_final[0:krylov_dim] contains the orthonormal basis vectors
-
-    # Time propagation: exp(-i*dt*H) for RTE, exp(-dt*H) for ITE (T and
-    # expm in double, see _sil_expm_coeffs)
-    coeffs = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time, vec_dtype)
-
-    # SIL Krylov truncation error (Saad bound), relative
-    sil_error = jnp.abs(betas[-1] * coeffs[-1])
-
-    # Reconstruct: C_new = ||C|| * V^T @ coeffs (V is orthonormal)
-    c_new_flat = safe_norm * jnp.dot(coeffs, V_final)
-    c_new_flat = jnp.where(norm_c > 0, c_new_flat, c_flat)
-
     return c_new_flat.reshape(c_shape), sil_error
 
 
@@ -333,63 +599,42 @@ def _sil_solve_C_bidi(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, krylov_dim=10
     Returns:
         (C_fwd, C_bwd, sil_error_fwd)
     """
-    c_flat = C.reshape(-1)
-    dim = c_flat.shape[0]
-    norm_c = jnp.linalg.norm(c_flat)
-    safe_norm = jnp.where(norm_c > 0, norm_c, 1.0)
-
     # Loop-invariant integral precontraction (see _sil_solve_C)
     ops = mctdh.dCI.precompute_ci_ops(h_MO_list, g_MO_dict)
 
     def apply_H(v_flat):
         return mctdh.dCI.apply_ci_ops(ops, v_flat.reshape(c_shape)).reshape(-1)
 
-    v0 = c_flat / safe_norm
-
-    V_init = jnp.zeros((krylov_dim, dim), dtype=c_flat.dtype)
-    vec_dtype = c_flat.dtype
-    real_dtype = c_flat.real.dtype
-
-    def lanczos_step(carry, j):
-        V, v_prev, v_curr, beta_prev = carry
-        V = V.at[j].set(v_curr)
-        w = apply_H(v_curr).astype(vec_dtype)
-        alpha = jnp.real(jnp.dot(v_curr.conj(), w)).astype(real_dtype)
-        w = w - alpha * v_curr - beta_prev * v_prev
-        overlaps = jnp.dot(V.conj(), w)
-        w = w - jnp.dot(overlaps, V)
-        beta = jnp.sqrt(jnp.real(jnp.dot(w.conj(), w))).astype(real_dtype)
-        safe_beta = jnp.where(beta > 1e-15, beta, 1.0)
-        v_next = w / safe_beta
-        return (V, v_curr, v_next, beta), (alpha, beta)
-
-    init = (V_init, jnp.zeros_like(v0), v0, jnp.array(0.0, dtype=real_dtype))
-    (V_final, _, _, _), (alphas, betas) = jax.lax.scan(
-        lanczos_step, init, jnp.arange(krylov_dim), length=krylov_dim
+    c_fwd_flat, c_bwd_flat, sil_error = _lanczos_expm_bidi(
+        apply_H, C.reshape(-1), dt, mctdh.imag_time, krylov_dim
     )
-
-    # Both directions from the same T (T and expm in double, see
-    # _sil_expm_coeffs). Forward: exp(-i*dt*H) for RTE, exp(-dt*H) for ITE
-    coeffs_fwd = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time,
-                                  c_flat.dtype, sign=-1.0)
-    coeffs_bwd = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time,
-                                  c_flat.dtype, sign=+1.0)
-
-    # SIL error from forward propagation
-    sil_error = jnp.abs(betas[-1] * coeffs_fwd[-1])
-
-    # Reconstruct both directions
-    c_fwd_flat = safe_norm * jnp.dot(coeffs_fwd, V_final)
-    c_fwd_flat = jnp.where(norm_c > 0, c_fwd_flat, c_flat)
-
-    c_bwd_flat = safe_norm * jnp.dot(coeffs_bwd, V_final)
-    c_bwd_flat = jnp.where(norm_c > 0, c_bwd_flat, c_flat)
-
     return c_fwd_flat.reshape(c_shape), c_bwd_flat.reshape(c_shape), sil_error
 
 
-def _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape):
-    """Exact CI propagator for the linearised CMF substep.
+def _ci_apply_fn(mctdh, h_MO_list, g_MO_dict):
+    """``σ = H|C⟩`` as a callable, for ``_diag_solve_C``.
+
+    Accepts tensors of shape ``(..., n_dets_0, ...)`` — any leading batch
+    shape — which is what lets ``_diag_solve_C`` build the dense CI
+    Hamiltonian by applying it to a batch of unit vectors.
+
+    This wraps ``get_sigma`` rather than hoisting the integral
+    precontraction out of it: ``_diag_solve_C`` applies H exactly once, so
+    there is nothing to hoist, and splitting ``get_sigma`` into its two
+    jitted halves changes the HLO the GPU backend fuses, which moves the last
+    bit of a propagated trajectory (``tests/test_refactor_pins.py``).
+    """
+    return lambda X: mctdh.dCI.get_sigma(X, h_MO_list, g_MO_dict)
+
+
+def _diag_solve_C(apply_H, C, dt, imag_time, c_shape):
+    """Exact top-block propagator for the linearised CMF substep.
+
+    ``apply_H`` applies the (Hermitian) top-block Hamiltonian to a tensor of
+    shape ``(..., *c_shape[1:])``; the dense matrix is recovered by applying
+    it to the identity. Standard MCTDHF passes ``_ci_apply_fn`` (determinant
+    space); ML-MCTDHF passes ``apply_ci_ops(top_ops, ·)`` in SPF space, where
+    ``prod(num_spfs)`` is small enough that this is the cheap choice.
 
     ITE: replace C by the lowest ``num_states`` eigenvectors of H_CI via a
     dense eigendecomposition. The input C is used only as a dtype/shape
@@ -401,7 +646,7 @@ def _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape):
     (``U @ diag(exp(-i*dt*λ)) @ U†``), ``expm``'s reverse-mode VJP is built
     from matmuls and a linear solve — it has no ``1/(λ_i-λ_j)`` terms, so it
     does not produce NaN gradients when H_CI has degenerate eigenvalues
-    (verified 2026-05-22). Forward value and unitarity match the eigh route
+    (verified). Forward value and unitarity match the eigh route
     to machine precision at the dt·‖H_CI‖ of a typical step, and expm is the
     faster of the two on GPU for the forward pass.
 
@@ -417,18 +662,28 @@ def _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape):
     for n in det_shape:
         n_dets_tot *= int(n)
 
-    # Build the dense CI Hamiltonian by applying get_sigma to the identity in
-    # the determinant basis. dCI.get_sigma uses '...' einsum strings so any
+    # Build the dense CI Hamiltonian by applying H to the identity in the
+    # determinant (or SPF) basis. apply_H uses '...' einsum strings so any
     # leading batch shape is accepted.
     eye = jnp.eye(n_dets_tot, dtype=C.dtype).reshape((n_dets_tot,) + det_shape)
-    sigma = mctdh.dCI.get_sigma(eye, h_MO_list, g_MO_dict)
+    sigma = apply_H(eye)
     H_CI = sigma.reshape(n_dets_tot, n_dets_tot)
     # Hermitise to clean up floating-point noise.
     H_CI = 0.5 * (H_CI + H_CI.conj().T)
 
-    if mctdh.imag_time:
+    if imag_time:
         # Lowest num_states eigenvectors as the new state-averaged CI vectors.
         # eigvecs columns -> states; transpose so the leading axis is `state`.
+        #
+        # NOTE the returned eigenvectors carry an ARBITRARY phase per state:
+        # eigh pins it by the backend's internal normalisation, and that
+        # choice moves discontinuously under a perturbation of the input far
+        # below the eigenvalue gap (~1e-8 rad for a 1e-13 input change, on
+        # cuSOLVER). This is harmless in a relaxation — a global phase per
+        # state leaves the energy, the densities and every |overlap|
+        # unchanged — but it means the coefficients themselves must never be
+        # compared elementwise between two implementations or two backends.
+        # tests/test_ml_exactness.py removes the phase before comparing.
         _, eigvecs = jnp.linalg.eigh(H_CI)  # ascending eigenvalues
         C_new = eigvecs[:, :num_states].T.reshape(c_shape)
     else:
@@ -476,10 +731,6 @@ def _sil_solve_bs(
     sil_errors = []
     for s in range(mctdh.num_species):
         b_s = bs_start[s]
-        b_flat = b_s.reshape(-1)
-        dim = b_flat.shape[0]
-        norm_b = jnp.linalg.norm(b_flat)
-        safe_norm = jnp.where(norm_b > 0, norm_b, 1.0)
 
         def apply_A(v_flat, _s=s):
             """Apply orbital Hamiltonian A such that db/dt = -iAb (RTE)."""
@@ -494,41 +745,10 @@ def _sil_solve_bs(
             else:
                 return (1j * rhs).reshape(-1)
 
-        v0 = b_flat / safe_norm
-
-        V_init = jnp.zeros((krylov_dim, dim), dtype=b_flat.dtype)
-
-        vec_dtype = b_flat.dtype
-        real_dtype = b_flat.real.dtype
-
-        def lanczos_step(carry, j):
-            V, v_prev, v_curr, beta_prev = carry
-            V = V.at[j].set(v_curr)
-            w = apply_A(v_curr).astype(vec_dtype)
-            alpha = jnp.real(jnp.dot(v_curr.conj(), w)).astype(real_dtype)
-            w = w - alpha * v_curr - beta_prev * v_prev
-            # Full re-orthogonalization
-            overlaps = jnp.dot(V.conj(), w)
-            w = w - jnp.dot(overlaps, V)
-            beta = jnp.sqrt(jnp.real(jnp.dot(w.conj(), w))).astype(real_dtype)
-            safe_beta = jnp.where(beta > 1e-15, beta, 1.0)
-            v_next = w / safe_beta
-            return (V, v_curr, v_next, beta), (alpha, beta)
-
-        init = (V_init, jnp.zeros_like(v0), v0, jnp.array(0.0, dtype=real_dtype))
-        (V_final, _, _, _), (alphas, betas) = jax.lax.scan(
-            lanczos_step, init, jnp.arange(krylov_dim), length=krylov_dim
+        b_new_flat, sil_error_s = _lanczos_expm(
+            apply_A, b_s.reshape(-1), dt, mctdh.imag_time, krylov_dim
         )
-
-        coeffs = _sil_expm_coeffs(alphas, betas, dt, mctdh.imag_time,
-                                  b_flat.dtype)
-
-        # SIL Krylov truncation error (Saad bound), relative
-        sil_error_s = jnp.abs(betas[-1] * coeffs[-1])
         sil_errors.append(sil_error_s)
-
-        b_new_flat = safe_norm * jnp.dot(coeffs, V_final)
-        b_new_flat = jnp.where(norm_b > 0, b_new_flat, b_flat)
         bs_new[s] = b_new_flat.reshape(b_shapes[s])
 
     return bs_new, jnp.max(jnp.array(sil_errors))
@@ -576,42 +796,17 @@ def _diag_solve_bs(
     """
     bs_new = list(bs_start)
     err_dtype = bs_start[0].real.dtype
-    out_dtype = bs_start[0].dtype
 
     for s in range(mctdh.num_species):
-        b_s = bs_start[s]
-        b_flat = b_s.reshape(-1)
-        N_s = b_shapes[s][0] * b_shapes[s][1]
 
-        def apply_once(b, _s=s):
-            rhs = mctdh._rhs_b_linear(
+        def rhs_b(b, _s=s):
+            return mctdh._rhs_b_linear(
                 b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, g2_frozen
             )
-            return rhs.reshape(-1)
 
-        # Build dense linear operator by vmapping apply_once over standard
-        # basis vectors of the flat (n_spatial · M) orbital space. This stays
-        # in the native bulk dtype even when compute_x64 is set.
-        I_cols = jnp.eye(N_s, dtype=b_s.dtype).reshape((N_s,) + b_shapes[s])
-        J_rows = jax.vmap(apply_once)(I_cols)   # row k = J · e_k
-        J_mat = J_rows.T                         # columns = J · e_k → J as matrix
-
-        # Extract A_s from _rhs_b_linear sign convention; form the expm argument.
-        if mctdh.imag_time:
-            arg = -dt * (-J_mat)
-        else:
-            arg = -1j * dt * (1j * J_mat)
-
-        # The non-Hermitian expm is the precision-critical step: optionally
-        # promote just it (and the application to b) to complex128.
-        if compute_x64:
-            expA = jax.scipy.linalg.expm(arg.astype(jnp.complex128))
-            b_new_flat = expA @ b_flat.astype(jnp.complex128)
-        else:
-            expA = jax.scipy.linalg.expm(arg)
-            b_new_flat = expA @ b_flat
-
-        bs_new[s] = b_new_flat.reshape(b_shapes[s]).astype(out_dtype)
+        bs_new[s] = _expm_dense_linear(
+            rhs_b, bs_start[s], dt, mctdh.imag_time, compute_x64=compute_x64
+        )
 
     return bs_new, jnp.zeros((), dtype=err_dtype)
 
@@ -691,7 +886,6 @@ def _dop_solve_bs(
     ``_diag_solve_bs`` tuple shape.
     """
     bs_new = []
-    h = dt / n_substeps
     for s, b_s in enumerate(bs_start):
 
         def rhs(b, _s=s):
@@ -699,23 +893,31 @@ def _dop_solve_bs(
                 b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, g2_frozen
             )
 
-        def one_substep(b, _):
-            ks = []
-            for i in range(7):
-                bi = b
-                for j, aij in enumerate(_DP_A[i]):
-                    if aij != 0.0:
-                        bi = bi + h * aij * ks[j]
-                ks.append(rhs(bi))
-            out = b
-            for coef, k in zip(_DP_B5, ks):
-                if coef != 0.0:
-                    out = out + h * coef * k
-            return out, None
-
-        b_out, _ = jax.lax.scan(one_substep, b_s, None, length=n_substeps)
-        bs_new.append(b_out)
+        bs_new.append(_dop_linear(rhs, b_s, dt, n_substeps))
     return bs_new, jnp.zeros((), dtype=bs_start[0].real.dtype)
+
+
+def _bs_linear(rhs_fn, x0, dt, bs_sequence=(2, 4, 6, 8, 12, 16)):
+    """Bulirsch–Stoer step of ``ẋ = rhs_fn(x)``.
+
+    Modified midpoint at each subdivision of ``bs_sequence``, then polynomial
+    (Neville) Richardson extrapolation in ``h²``, reaching
+    ``O(h^{2·len(sequence)})`` for relatively few RHS evaluations.
+    """
+    T_list = []
+    h_sq = []
+    for n in bs_sequence:
+        T_list.append(_bs_modified_midpoint(rhs_fn, x0, dt, n))
+        h_sq.append((dt / n) ** 2)
+
+    # T_list[i] has error O(h_i^2); extrapolation removes successive powers
+    # of h^2.
+    for k in range(1, len(bs_sequence)):
+        for i in range(len(bs_sequence) - 1, k - 1, -1):
+            ratio = h_sq[i - k] / h_sq[i]
+            T_list[i] = T_list[i] + (T_list[i] - T_list[i - 1]) / (ratio - 1)
+
+    return T_list[-1]
 
 
 def _bs_solve_bs(
@@ -740,30 +942,13 @@ def _bs_solve_bs(
     """
     bs_new = list(bs_start)
     for s in range(mctdh.num_species):
-        b_s = bs_start[s]
 
         def rhs_b(b, _s=s):
             return mctdh._rhs_b_linear(
                 b, _s, h_current[_s], D_invs[_s], ds, bs_frozen, g2_frozen
             )
 
-        # Compute modified midpoint approximations for each n in sequence
-        T_list = []
-        h_sq = []
-        for n in bs_sequence:
-            T_n = _bs_modified_midpoint(rhs_b, b_s, dt, n)
-            T_list.append(T_n)
-            h_sq.append((dt / n) ** 2)
-
-        # Polynomial extrapolation (Neville's algorithm)
-        # T_list[i] has error O(h_i^2), extrapolation removes successive
-        # powers of h^2 to reach O(h^{2*len(sequence)})
-        for k in range(1, len(bs_sequence)):
-            for i in range(len(bs_sequence) - 1, k - 1, -1):
-                ratio = h_sq[i - k] / h_sq[i]
-                T_list[i] = T_list[i] + (T_list[i] - T_list[i - 1]) / (ratio - 1)
-
-        bs_new[s] = T_list[-1]
+        bs_new[s] = _bs_linear(rhs_b, bs_start[s], dt, bs_sequence)
     return bs_new
 
 
@@ -816,10 +1001,16 @@ _B_KWARG_KEYS = {
     "bs": ("bs_sequence", "n_orbital_substeps"),
     "diagonalize": ("orbital_x64", "n_orbital_substeps"),
     "dop": ("n_substeps", "n_orbital_substeps"),
+    # Mixed-precision defect-form CN (_cn_defect_linear). Its default
+    # solver_tol is 1e-6, not 1e-8: the solve runs at lo_dtype.
+    "cn_mixed": ("solver_tol", "max_solver_iter", "lo_dtype",
+                 "n_orbital_substeps"),
 }
 _B_KWARG_KEYS_CMF = _B_KWARG_KEYS
 _B_KWARG_KEYS_HALF = _B_KWARG_KEYS
-_B_PROPAGATORS = ("cn", "bs", "sil", "diagonalize", "dop")
+_B_PROPAGATORS = ("cn", "bs", "sil", "diagonalize", "dop", "cn_mixed")
+_CN_MIXED_DEFAULT_TOL = 1e-6
+_CN_MIXED_DEFAULT_LO_DTYPE = jnp.complex64
 _C_PROPAGATORS = ("cn", "sil", "diagonalize")
 
 
@@ -851,6 +1042,11 @@ def _cmf_options(c_propagator, b_propagator, c_kwargs, b_kwargs):
         "orbital_x64": b_kwargs.get("orbital_x64", False),
         "n_orbital_substeps": int(b_kwargs.get("n_orbital_substeps", 1)),
     }
+    if b_propagator == "cn_mixed":
+        b_opts["solver_tol"] = b_kwargs.get("solver_tol",
+                                            _CN_MIXED_DEFAULT_TOL)
+        b_opts["lo_dtype"] = b_kwargs.get("lo_dtype",
+                                          _CN_MIXED_DEFAULT_LO_DTYPE)
     return c_opts, b_opts
 
 
@@ -861,7 +1057,10 @@ def _solve_C(mctdh, c_propagator, C, h_MO_list, g_MO_dict, dt, c_shape, opts):
             mctdh, C, h_MO_list, g_MO_dict, dt, c_shape, opts["krylov_dim"]
         )[0]
     if c_propagator == "diagonalize":
-        return _diag_solve_C(mctdh, C, h_MO_list, g_MO_dict, dt, c_shape)[0]
+        return _diag_solve_C(
+            _ci_apply_fn(mctdh, h_MO_list, g_MO_dict), C, dt,
+            mctdh.imag_time, c_shape,
+        )[0]
     return _cn_solve_C(
         mctdh, C, h_MO_list, g_MO_dict, dt, c_shape,
         opts["solver_tol"], opts["max_solver_iter"],
@@ -883,6 +1082,9 @@ def _solve_bs(
         return _dop_solve_bs(*args, opts["n_substeps"])[0]
     if b_propagator == "bs":
         return _bs_solve_bs(*args, opts["bs_sequence"])
+    if b_propagator == "cn_mixed":
+        return _cn_mixed_solve_bs(*args, opts["solver_tol"],
+                                  opts["max_solver_iter"], opts["lo_dtype"])
     return _cn_solve_bs(*args, opts["solver_tol"], opts["max_solver_iter"])
 
 
@@ -1031,8 +1233,8 @@ def get_cmf_half_step_integrator(
     but typically allows 5-10× larger dt in RTE, for a net speedup.
 
     Caution: the corrector freezes the projector and mean field at the
-    PREDICTED b(t+dt/2). On stiff orbital equations (DVR grids, four-well
-    N=3 record 2026-09-14) that feedback is a linear instability at every dt;
+    PREDICTED b(t+dt/2). On stiff orbital equations (DVR grids, e.g.
+    the three-electron four-well system) that feedback is a linear instability at every dt;
     get_cmf_midpoint_integrator is the same layout without the predictor.
 
     Args:
@@ -1122,7 +1324,8 @@ def get_cmf_half_step_integrator(
             )
         elif c_propagator == "diagonalize":
             C_half, _ = _diag_solve_C(
-                mctdh, C, h_MO_list_t, g_MO_dict_t, dt_half, c_shape
+                _ci_apply_fn(mctdh, h_MO_list_t, g_MO_dict_t), C, dt_half,
+                mctdh.imag_time, c_shape,
             )
         else:
             C_half = _cn_solve_C(
@@ -1311,11 +1514,10 @@ def get_cmf_half_step_integrator(
             )
         elif c_propagator == "diagonalize":
             C_new, _ = _diag_solve_C(
-                mctdh,
+                _ci_apply_fn(mctdh, h_MO_list_new, g_MO_dict_new),
                 C_half,
-                h_MO_list_new,
-                g_MO_dict_new,
                 dt_half,
+                mctdh.imag_time,
                 c_shape,
             )
         else:
@@ -1357,8 +1559,8 @@ def get_cmf_midpoint_integrator(
     Unlike get_cmf_half_step_integrator there is NO orbital predictor: that
     integrator freezes the projector and mean field at a predicted b(t+dt/2),
     and feeding a predicted orbital back through (1-P) with the stiff one-body
-    operator is a linear instability at every dt (four-well N=3 record,
-    2026-09-14). Cost: two CI half-steps and one orbital step, i.e. ~2x the
+    operator is a linear instability at every dt (observed for
+    the three-electron four-well system). Cost: two CI half-steps and one orbital step, i.e. ~2x the
     basic integrator when the CI step dominates.
 
     Args: as get_cmf_integrator.

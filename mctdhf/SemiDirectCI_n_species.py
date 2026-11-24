@@ -35,6 +35,19 @@ def _segment_sum(data, ids, num_segments):
     return (out[..., 0] + 1j * out[..., 1]).astype(data.dtype)
 
 
+def _inter_rdm_transpose(d):
+    """Reverse the species order of an inter-species 2-RDM / mean field.
+
+    Excitation operators of different species commute, so
+
+        d^{(s2,s1)}_{pqrs} = ⟨E^{s2}_{pr} E^{s1}_{qs}⟩ = d^{(s1,s2)}_{qpsr},
+
+    i.e. the reversed pair is a pure index permutation of the computed one.
+    Batch axes are carried through.
+    """
+    return jnp.einsum("...pqrs->...qpsr", d)
+
+
 class _SparseExc:
     """Nonzero entries of an excitation tensor E_{ij,o} in coordinate form.
 
@@ -67,12 +80,13 @@ class _SparseExc:
 
     ``val`` is float32, matching the dtype the dense tensors were stored in, so
     promotion against complex128 integrals is unchanged. float32 is exact here
-    (entries are ±1) — asserted in the Part 2 dtype guard.
+    (entries are ±1).
     """
 
     __slots__ = ("n_dets", "n_orb", "k", "nnz",
                  "det_d", "orb_d", "val_d", "orb_split_d",
-                 "det_o", "orb_o", "val_o")
+                 "det_o", "orb_o", "val_o",
+                 "bra_d", "ket_d", "bra_o", "ket_o")
 
     def __init__(self, det, orb, val, n_dets, n_orb, k):
         self.n_dets, self.n_orb, self.k = int(n_dets), int(n_orb), int(k)
@@ -85,6 +99,16 @@ class _SparseExc:
         self.det_o = jnp.asarray(det[oo])
         self.orb_o = jnp.asarray(orb[oo])
         self.val_o = jnp.asarray(val[oo], dtype=jnp.float32)
+        # The flat ``det`` index split back into its bra (I) and ket (I')
+        # halves, in both sort orders. ``E_{ij,o}`` stores ``det = i*n_dets + j``
+        # with i the BRA determinant, so ``bra_* // n_dets`` is i and
+        # ``ket_* % n_dets`` is j. ``bra_d`` is non-decreasing (``det_d`` is
+        # sorted), which is what lets the ML mean-field scatter on it pass
+        # ``indices_are_sorted=True``.
+        self.bra_d = jnp.asarray(det[od] // n_dets, dtype=jnp.int32)
+        self.ket_d = jnp.asarray(det[od] % n_dets, dtype=jnp.int32)
+        self.bra_o = jnp.asarray(det[oo] // n_dets, dtype=jnp.int32)
+        self.ket_o = jnp.asarray(det[oo] % n_dets, dtype=jnp.int32)
         # orbital multi-index split back into its k components, det-sorted;
         # needed where a contraction keeps some orbital indices free
         # (the inter-species T1 build).
@@ -140,7 +164,7 @@ class _DenseExcView:
     Materialises one species' dense tensor on demand and does NOT cache it —
     caching would reinstate exactly the memory the sparse storage removes.
     Present for the external consumers that legitimately want the dense object
-    (the C1 operator-identity test, dtype guards); nothing on the hot path uses
+    (operator-identity and dtype checks); nothing on the hot path uses
     it."""
 
     __slots__ = ("_sp",)
@@ -202,8 +226,8 @@ class SemiDirectCI_n_species:
             It is marginally SLOWER at very small CI dimension, where the fixed
             gather/scatter cost does not shrink with n_dets: measured 1.13x
             (+132 us/step) at CI dim 6, 1.07x at CI dim 16, and ~1.00x at
-            CI dim 256-625. ``sparse=False`` selects the original dense path,
-            unchanged, for reproducing pre-2026-08-31 results bit-for-bit or if
+            CI dim 256-625. ``sparse=False`` selects the dense path of earlier
+            versions, unchanged, for reproducing their results bit-for-bit or if
             a small configuration is ever step-rate critical.
         """
         self.sparse = bool(sparse)
@@ -259,7 +283,7 @@ class SemiDirectCI_n_species:
     # `dci.E_pq[s]` / `dci.E_pqrs[s]` still return the dense float32 tensors
     # they always did, materialised on demand. Nothing on the hot path uses
     # them; they exist for the external consumers that want the dense object
-    # (the C1 operator-identity test, dtype guards, diagnostics).
+    # (operator-identity and dtype checks, diagnostics).
 
     @property
     def E_pq(self):
@@ -510,6 +534,83 @@ class SemiDirectCI_n_species:
 
     # ── JAX-compiled CI operations ────────────────────────────────────────
 
+    def precompute_species_ops(self, h_list, g_dict):
+        """The single-species (determinant-space) operators ``ops_diag``.
+
+        ``ops_diag[s][I, I'] = ⟨I| h_s + 0.5 g_ss |I'⟩`` in the determinant
+        basis of species s: ``E_pq·h_s`` plus, when an intra-species
+        interaction is present, ``0.5·E_pqrs·g_ss``. Bra index first.
+
+        Split out of :meth:`precompute_ci_ops` so the ML-MCTDHF layer
+        operators can reuse the identical contraction (the species operator ``Op_s``);
+        :meth:`precompute_ci_ops` calls it, so the two can never drift.
+
+        Deliberately NOT ``@jit``-decorated. A nested ``jit`` inside
+        :meth:`precompute_ci_ops` emits its own HLO call node, and XLA's GPU
+        backend then fuses across it differently from the inlined original —
+        enough to move the last bit of a propagated trajectory and break
+        ``tests/test_refactor_pins.py`` on GPU while CPU stayed identical.
+        Traced inline, the jaxpr is exactly the one the pre-refactor code
+        produced. Callers that want a jitted entry point have one in
+        :meth:`SemiDirectCI_ML.ml_species_ops`.
+        """
+        ops_diag = []
+        for s in range(self.num_species):
+            # Sparse: gather the integral at each nonzero excitation and
+            # scatter-add onto (i, j). Equivalent to
+            #   contract("ijpq, pq -> ij", E_pq[s], h_list[s])
+            # over ~1e-3 of the terms; validated bit-identical.
+            if self.sparse:
+                Op_s = self._sp_pq[s].contract_orb(h_list[s])
+            else:
+                Op_s = contract("ijpq, pq -> ij", self._dn_pq[s], h_list[s],
+                                backend="jax")
+            if (s, s) in g_dict:
+                # Intra-species: factor 0.5 (double counting in sum)
+                if self.sparse:
+                    Op_s = Op_s + 0.5 * self._sp_pqrs[s].contract_orb(
+                        g_dict[(s, s)])
+                else:
+                    Op_s = Op_s + 0.5 * contract(
+                        "ijpqrs, pqrs -> ij", self._dn_pqrs[s],
+                        g_dict[(s, s)], backend="jax")
+            ops_diag.append(Op_s)
+        return ops_diag
+
+    def _pair_op_dense_dets(self, s1, s2, g_int, factor):
+        """The inter-species determinant-space operator ``Op_12``.
+
+        ``factor · Σ_{pqrs} g_int[p,q,r,s] E^{s1}_{pr} E^{s2}_{qs}`` as a
+        dense ``(D_1, D_1, D_2, D_2)`` array, bra indices first in each pair.
+
+        Split out of :meth:`precompute_ci_ops` unchanged; this is the object
+        the ML top layer replaces by its ``n_1² n_2²`` analogue
+        (``Ṽ^{sk}``), and it is kept here for the ``n_s = D_s`` limit and the
+        layer-identity tests.
+        """
+        # E_pq[s1]'s two orbital indices play the roles (p, r) here, so the
+        # g slice g[p, :, r, :] is gathered per nonzero and scatter-added
+        # onto (i, j) with (q, s) left free:
+        #   T1 = contract("ijpr, pqrs -> ijqs", E_pq[s1], g_int)
+        if not self.sparse:
+            T1 = contract("ijpr, pqrs -> ijqs", self._dn_pq[s1], g_int,
+                          backend="jax")
+            return factor * contract(
+                "ijqs, klqs -> ijkl", T1, self._dn_pq[s2], backend="jax")
+        sp1, sp2 = self._sp_pq[s1], self._sp_pq[s2]
+        p_idx, r_idx = sp1.orb_split_d
+        n1, n2 = sp1.n_dets, sp2.n_dets
+        m2 = sp2.n_orb
+        g_sl = g_int[p_idx, :, r_idx, :]                     # (nnz1, m2, m2)
+        T1 = _segment_sum(sp1.val_d[:, None, None] * g_sl, sp1.det_d,
+                          n1 * n1)                           # (n1^2, m2, m2)
+        #   Op_12 = contract("ijqs, klqs -> ijkl", T1, E_pq[s2])
+        cols = T1.reshape(n1 * n1, m2 * m2)[:, sp2.orb_d]    # (n1^2, nnz2)
+        Op_12 = _segment_sum((cols * sp2.val_d[None, :]).T, sp2.det_d,
+                             n2 * n2)                        # (n2^2, n1^2)
+        Op_12 = Op_12.T.reshape(n1, n1, n2, n2)
+        return factor * Op_12
+
     @partial(jit, static_argnums=0)
     def precompute_ci_ops(self, h_list, g_dict):
         """Contract the MO integrals with the excitation tensors once.
@@ -537,27 +638,7 @@ class SemiDirectCI_n_species:
             ops_pair[(s1, s2)] is the (D_1, D_1, D_2, D_2) inter-species
             operator with the counting factor folded in.
         """
-        ops_diag = []
-        for s in range(self.num_species):
-            # Sparse: gather the integral at each nonzero excitation and
-            # scatter-add onto (i, j). Equivalent to
-            #   contract("ijpq, pq -> ij", E_pq[s], h_list[s])
-            # over ~1e-3 of the terms; validated bit-identical.
-            if self.sparse:
-                Op_s = self._sp_pq[s].contract_orb(h_list[s])
-            else:
-                Op_s = contract("ijpq, pq -> ij", self._dn_pq[s], h_list[s],
-                                backend="jax")
-            if (s, s) in g_dict:
-                # Intra-species: factor 0.5 (double counting in sum)
-                if self.sparse:
-                    Op_s = Op_s + 0.5 * self._sp_pqrs[s].contract_orb(
-                        g_dict[(s, s)])
-                else:
-                    Op_s = Op_s + 0.5 * contract(
-                        "ijpqrs, pqrs -> ij", self._dn_pqrs[s],
-                        g_dict[(s, s)], backend="jax")
-            ops_diag.append(Op_s)
+        ops_diag = self.precompute_species_ops(h_list, g_dict)
 
         ops_pair = {}
         for (s1, s2), g_int in g_dict.items():
@@ -565,29 +646,7 @@ class SemiDirectCI_n_species:
                 continue
             # If both (s1,s2) and (s2,s1) present → 0.5 each; else → 1.0
             factor = 0.5 if (s2, s1) in g_dict else 1.0
-            # Sparse both halves. E_pq[s1]'s two orbital indices play the
-            # roles (p, r) here, so the g slice g[p, :, r, :] is gathered per
-            # nonzero and scatter-added onto (i, j) with (q, s) left free:
-            #   T1 = contract("ijpr, pqrs -> ijqs", E_pq[s1], g_int)
-            if not self.sparse:
-                T1 = contract("ijpr, pqrs -> ijqs", self._dn_pq[s1], g_int,
-                              backend="jax")
-                ops_pair[(s1, s2)] = factor * contract(
-                    "ijqs, klqs -> ijkl", T1, self._dn_pq[s2], backend="jax")
-                continue
-            sp1, sp2 = self._sp_pq[s1], self._sp_pq[s2]
-            p_idx, r_idx = sp1.orb_split_d
-            n1, n2 = sp1.n_dets, sp2.n_dets
-            m2 = sp2.n_orb
-            g_sl = g_int[p_idx, :, r_idx, :]                     # (nnz1, m2, m2)
-            T1 = _segment_sum(sp1.val_d[:, None, None] * g_sl, sp1.det_d,
-                              n1 * n1)                           # (n1^2, m2, m2)
-            #   Op_12 = contract("ijqs, klqs -> ijkl", T1, E_pq[s2])
-            cols = T1.reshape(n1 * n1, m2 * m2)[:, sp2.orb_d]    # (n1^2, nnz2)
-            Op_12 = _segment_sum((cols * sp2.val_d[None, :]).T, sp2.det_d,
-                                 n2 * n2)                        # (n2^2, n1^2)
-            Op_12 = Op_12.T.reshape(n1, n1, n2, n2)
-            ops_pair[(s1, s2)] = factor * Op_12
+            ops_pair[(s1, s2)] = self._pair_op_dense_dets(s1, s2, g_int, factor)
 
         return ops_diag, ops_pair
 
@@ -669,6 +728,36 @@ class SemiDirectCI_n_species:
         rho_ci_str = f"...{''.join(c_conj_indices)},...{''.join(c_indices)}->...xy"
         return contract(rho_ci_str, C.conj(), C, backend="jax")
 
+    def _compute_rho_pair(self, C, s1, s2, weights=None):
+        """Reduced CI pair density of species ``(s1, s2)``, in "xzyw" order.
+
+        ``ρ^{s1 s2}[x, z, y, w] = Σ_{other} C*_{...x...z...} C_{...y...w...}``
+        with ``x, y`` on species ``s1`` and ``z, w`` on species ``s2``; the
+        two CONJUGATED indices come first (x, z), then the two unconjugated
+        ones (y, w). Shape-agnostic in the same way as
+        :meth:`_compute_rho_ci`: it contracts every axis but ``s1`` and
+        ``s2``, so it applies unchanged to the ML top tensor ``A`` (SPF
+        indices) as well as to the CI tensor ``C`` (determinant indices).
+
+        Returns ``(..., n_1, n_2, n_1, n_2)`` where ``...`` is the batch
+        (state) axis, or no batch axis at all when ``weights`` is given —
+        the state axis is then contracted here, which is exact because every
+        downstream contraction is linear in ρ.
+        """
+        idx_conj = [chr(97 + i) for i in range(self.num_species)]
+        idx_norm = [chr(97 + i) for i in range(self.num_species)]
+        idx_conj[s1], idx_conj[s2] = "x", "z"
+        idx_norm[s1], idx_norm[s2] = "y", "w"
+
+        if weights is not None:
+            rho_pair_str = (f"S,S{''.join(idx_conj)},"
+                            f"S{''.join(idx_norm)}->xzyw")
+            return contract(rho_pair_str, weights, C.conj(), C, backend="jax")
+        rho_pair_str = (
+            f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
+        )
+        return contract(rho_pair_str, C.conj(), C, backend="jax")
+
     @partial(jit, static_argnums=0)
     def get_1p_RDMs(self, C, weights=None):
         """Compute 1-particle reduced density matrices for all species.
@@ -728,22 +817,7 @@ class SemiDirectCI_n_species:
         for s1 in range(self.num_species):
             for s2 in range(s1 + 1, self.num_species):
                 # Contract over all indices except s1 and s2
-                idx_conj = [chr(97 + i) for i in range(self.num_species)]
-                idx_norm = [chr(97 + i) for i in range(self.num_species)]
-                idx_conj[s1], idx_conj[s2] = "x", "z"
-                idx_norm[s1], idx_norm[s2] = "y", "w"
-
-                if weights is not None:
-                    rho_pair_str = (f"S,S{''.join(idx_conj)},"
-                                    f"S{''.join(idx_norm)}->xzyw")
-                    rho_pair = contract(rho_pair_str, weights, C.conj(), C,
-                                        backend="jax")
-                else:
-                    rho_pair_str = (
-                        f"...{''.join(idx_conj)},...{''.join(idx_norm)}->...xzyw"
-                    )
-                    rho_pair = contract(rho_pair_str, C.conj(), C,
-                                        backend="jax")
+                rho_pair = self._compute_rho_pair(C, s1, s2, weights)
 
                 # Sparse, in two segment_sums:
                 #   B[..., pr, zw] = sum_xy rho[..., xy, zw] E1[xy, pr]
@@ -754,7 +828,7 @@ class SemiDirectCI_n_species:
                         "...xzyw, xypr, zwqs -> ...pqrs", rho_pair,
                         self._dn_pq[s1], self._dn_pq[s2], backend="jax")
                     ds[(s1, s2)] = d_inter
-                    ds[(s2, s1)] = jnp.einsum("...pqrs->...qpsr", d_inter)
+                    ds[(s2, s1)] = _inter_rdm_transpose(d_inter)
                     continue
                 sp1, sp2 = self._sp_pq[s1], self._sp_pq[s2]
                 n1, n2 = sp1.n_dets, sp2.n_dets
@@ -773,7 +847,7 @@ class SemiDirectCI_n_species:
                     "...prqs->...pqrs",
                     d_pr_qs.reshape(d_pr_qs.shape[:-2] + (m1, m1, m2, m2)))
                 ds[(s1, s2)] = d_inter
-                ds[(s2, s1)] = jnp.einsum("...pqrs->...qpsr", d_inter)
+                ds[(s2, s1)] = _inter_rdm_transpose(d_inter)
 
         return ds
 

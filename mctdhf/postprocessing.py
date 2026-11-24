@@ -102,19 +102,22 @@ def _apply_gauge_transform(C, bs, Us, num_species):
 # ── Observables ───────────────────────────────────────────────────────────────
 
 
-@partial(jit, static_argnums=(0,))
-def particle_densities(mctdh, C, bs_list, spf_list=None):
-    """Compute particle densities for all species.
+def particle_densities_from_rdms(Ds, bs_list, spf_list=None):
+    """Particle densities from ready-made 1-RDMs.
 
-    If ``spf_list`` is supplied, returns the density on the underlying grid,
-    ``ρ(x) = Σ_{nm} D_{nm} φ*_n(x) φ_m(x)``. Otherwise returns the density
-    matrix in the spatial-orbital basis.
+    ``Ds[s]`` is the per-state 1-RDM of species ``s`` in its MO basis, shape
+    ``(num_states, M_s, M_s)``; ``bs_list[s]`` its orbital matrix. With
+    ``spf_list`` the density is evaluated on the underlying grid,
+    ``ρ(x) = Σ_{nm} D_{nm} φ*_n(x) φ_m(x)``; without it the density matrix in
+    the spatial-orbital basis is returned.
+
+    The RDM-based core of :func:`particle_densities`, so that ML-MCTDHF —
+    whose 1-RDMs come from ``(A, B)`` rather than from a CI tensor — shares
+    exactly this code.
     """
-    Ds = mctdh.dCI.get_1p_RDMs(C)
     densities = []
 
-    for s in range(mctdh.num_species):
-        D_s = Ds[s]
+    for s, D_s in enumerate(Ds):
         b_s = bs_list[s]
 
         if spf_list is not None and len(spf_list) > s:
@@ -128,6 +131,19 @@ def particle_densities(mctdh, C, bs_list, spf_list=None):
             )
         densities.append(rho)
     return densities
+
+
+@partial(jit, static_argnums=(0,))
+def particle_densities(mctdh, C, bs_list, spf_list=None):
+    """Compute particle densities for all species.
+
+    If ``spf_list`` is supplied, returns the density on the underlying grid,
+    ``ρ(x) = Σ_{nm} D_{nm} φ*_n(x) φ_m(x)``. Otherwise returns the density
+    matrix in the spatial-orbital basis.
+    """
+    return particle_densities_from_rdms(
+        mctdh.dCI.get_1p_RDMs(C), bs_list, spf_list
+    )
 
 
 def subsystem_character(mctdh, C):

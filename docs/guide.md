@@ -1,4 +1,4 @@
-# MCTDHF N-Species: Setup and ITE Guide
+# Multi-species MCTDHF: Setup and ITE Guide
 
 This guide covers how to set up a two-species MCTDHF calculation (e.g., spin-up and spin-down electrons) with spin-dependent Hamiltonians, using a Sine-DVR spatial basis and imaginary time evolution via the CMF integrator.
 
@@ -348,3 +348,151 @@ C, bs = mctdh._y_to_Cb(ys[-1])
 spf_list = [dvr.get_spf(), dvr.get_spf()]
 densities = mctdh.calculate_particle_densities(C, bs, spf_list)
 ```
+
+## ML-MCTDHF
+
+Multi-layer MCTDHF inserts a third layer between the CI tensor and the Slater
+determinants. Per species there are `n_s` many-body **single-particle
+functions** (SPFs), each a vector in that species' determinant space, and the
+top tensor runs over SPF indices rather than determinant indices:
+
+```
+A   : (num_states, n_0, ..., n_{K-1})   top tensor
+B_s : (D_s, n_s)                        SPFs in the determinant basis
+b_s : (N_spatial_s, M_s)                orbitals   (unchanged)
+```
+
+with `|phi^s_j> = sum_I B_s[I,j] |Phi^s_I(b_s)>` and
+`|Psi_a> = sum_j A[a, j_0..j_{K-1}] prod_s |phi^s_{j_s}>`.
+
+The packed state is `y = [A, B_0 ... B_{K-1}, b_0 ... b_{K-1}]`. There is no CI
+tensor in it, so `_y_to_Cb` raises; use `expand_C(A, Bs)` or `to_mctdhf_y(y)`.
+
+Why it matters: at four wells of N = 3 with `norb = 9` the CI tensor is
+`16 * 84^4 = 8.0e8` coefficients and the Lanczos basis alone is 42 GB. With
+`n_s = 6` the top tensor is `16 * 6^4 = 20736` and the inter-species pair
+operator drops from `84^2 * 84^2` to `6^2 * 6^2`. The orbital step is
+untouched, so it becomes the whole cost. Standard MCTDHF is recovered exactly
+at `n_s = D_s`, where the SPF equation gives `dB/dt = 0` and the solve is
+skipped.
+
+### Setting up
+
+```python
+from mctdhf.MLMCTDHF_n_species import MLMCTDHF_n_species_DVR, make_regauge_ml
+from mctdhf.integrators_ml import (
+    get_ml_cmf_integrator, get_ml_cmf_midpoint_integrator,
+)
+
+ml = MLMCTDHF_n_species_DVR(
+    h_list=h_list,
+    g_dict=g_dict,
+    num_particles=[3, 3, 3, 3],
+    num_mctdhf_orbitals=[9, 9, 9, 9],
+    num_spatial_orbitals=[N] * 4,
+    num_states=16,
+    imag_time=False,
+    num_spfs=[6, 6, 6, 6],   # 1 <= n_s <= D_s = C(9, 3) = 84
+    eps_spf=1e-6,            # defaults to eps
+)
+```
+
+`num_spfs` and `eps_spf` are keyword-only; everything else is the standard
+constructor. `MLMCTDHF_n_species` is the 4-index-integral variant.
+
+### Propagating
+
+```python
+step = get_ml_cmf_integrator(
+    ml, dt=0.01,
+    a_propagator="sil",           # top layer
+    B_propagator="diagonalize",   # SPF layer
+    b_propagator="cn",            # orbital layer
+    a_kwargs={"krylov_dim": 10},
+    B_kwargs={"n_spf_substeps": 2},
+    b_kwargs={"n_orbital_substeps": 4},
+)
+
+ts, ys = ml.integrate(step, num_steps=1000, normalize=True,
+                      noise_A=1e-3, noise_bs=1e-3, save_every=100)
+```
+
+`get_ml_cmf_midpoint_integrator` is the second-order layout
+`A/2 . B/2 . b . B/2 . A/2`; it costs one extra top and SPF half-step and
+takes the same arguments. These two are the only ML integrators: adaptive
+stepping, PSI and the coupled RK4/VMF routes are not implemented for ML.
+
+Option names follow the standard integrators. `a_kwargs` takes the CI keys
+(`krylov_dim` for `sil`; `solver_tol` and `max_solver_iter` for `cn`),
+`b_kwargs` is exactly the orbital solver's, and `B_kwargs` is the orbital
+solver's with `n_orbital_substeps` renamed `n_spf_substeps`. The SPF default
+`diagonalize` is a dense matrix exponential of the `D_s * n_s` linearised
+generator: exact within the substep and safe for a non-Hermitian generator,
+which this one is.
+
+Without explicit initial layers, `integrate` starts from the lowest
+eigenvectors of `h_s` for the orbitals, the lowest `n_s` eigenvectors of the
+bare species Hamiltonian `Op_s` for the SPFs, and energy-ordered product
+states for the top tensor.
+
+### Starting from an existing MCTDHF state
+
+`from_mctdhf` performs a truncated higher-order SVD, keeping the `n_s`
+dominant natural SPFs per species, and reports what it threw away:
+
+```python
+C, bs = mctdh._y_to_Cb(y_standard)
+A, Bs, bs, discarded = ml.from_mctdhf(C, bs)
+y_ml = ml._ABb_to_y(A, Bs, bs)
+print("discarded weight per species:", [float(d) for d in discarded])
+
+y_back = ml.to_mctdhf_y(y_ml)          # back to the standard layout
+```
+
+`from_species_vectors(vecs, A)` builds the SPF layer from given
+determinant-space vectors instead, Loewdin-orthonormalising them and
+transforming `A` so the state is unchanged. That is the route for a logical
+basis of frozen per-well states.
+
+### Monitoring convergence
+
+```python
+pops = ml.spf_populations(y)        # eigenvalues of the node density, per species
+occ  = ml.natural_occupations(y)    # eigenvalues of the 1-RDM, per species
+```
+
+`spf_populations` is the convergence monitor for `n_s`: the weight in the
+lowest-populated SPF is what raising `n_s` would recover, and it is the same
+quantity `from_mctdhf` reports as discarded. `natural_occupations` is the
+monitor for the orbital budget `M_s`, and sums to `N_s`.
+
+### Re-gauging
+
+Non-unitary sub-propagators (Crank-Nicolson in particular) let `b_s` and
+`B_s` drift off orthonormality. `make_regauge_ml` repairs both layers exactly,
+without changing the state:
+
+```python
+regauge = make_regauge_ml(ml)
+y = regauge(y)
+```
+
+It QR-factorises `b_s`, pushes the triangular factor onto `B_s` through the
+N-th compound matrix of `R` (the exterior power, which is what a Slater
+determinant of N orbitals transforms with), then QR-factorises `B_s` and
+pushes that triangular factor onto `A`. `rotate_to_natural_spfs(y)` is a
+second, cheaper gauge transform that diagonalises the node density so the SPF
+populations come out ordered.
+
+### Observables
+
+```python
+E = ml.calculate_energy(t, y)                       # per state
+S = ml.calculate_overlap(y1, y2)                    # per state pair
+A, Bs, bs = ml._y_to_ABb(y)
+dens = ml.calculate_particle_densities(A, Bs, bs, spf_list)
+Ds = ml.get_1p_RDMs(y)
+```
+
+The overlap sandwiches the determinant overlap matrices between the two SPF
+matrices, so it never forms the expanded CI tensor.

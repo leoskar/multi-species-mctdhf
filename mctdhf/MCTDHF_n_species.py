@@ -144,6 +144,8 @@ class MCTDHF_n_species:
         first step. Default 0.0 (no shift).
     """
 
+    _ci_class = SemiDirectCI_n_species
+
     def __init__(
         self,
         h_list,
@@ -183,11 +185,16 @@ class MCTDHF_n_species:
                 )
         self.g_dict = g_dict
 
-        # ci_sparse=False selects the pre-2026-08-31 dense excitation
-        # tensors; see SemiDirectCI_n_species.__init__ for when that is
+        # ci_sparse=False selects the dense excitation tensors of earlier
+        # versions; see SemiDirectCI_n_species.__init__ for when that is
         # the better choice (very small CI dimension) and for the
         # measured trade-off.
-        self.dCI = SemiDirectCI_n_species(
+        #
+        # _ci_class is the CI backend this solver builds. Subclasses override
+        # it rather than rebuilding dCI after __init__ (the determinant
+        # tables and excitation tensors are not cheap to construct twice);
+        # ML-MCTDHF sets it to SemiDirectCI_ML.
+        self.dCI = self._ci_class(
             num_mctdhf_orbitals, num_particles, sparse=ci_sparse)
         self.num_dets = self.dCI.num_dets
         self.num_states = num_states
@@ -988,10 +995,21 @@ class MCTDHF_n_species:
 
         y_init = self._Cb_to_y(C_init, bs_init_list)
         self._resolve_auto_e_shift(t_init, y_init)
-        t = t_init
-        y = y_init
 
-        # Handle normalization option
+        norm_mode = self._resolve_norm_mode(normalize)
+        return self._scan_integrate(
+            integrator, y_init, t_init, num_steps, save_every,
+            self._make_norm_fn(norm_mode),
+        )
+
+    # ── Shared propagation loop ───────────────────────────────────────────
+
+    def _resolve_norm_mode(self, normalize):
+        """Map the public ``normalize`` argument to a mode string.
+
+        ``True`` and ``None``-in-imaginary-time mean 'orthonormalize';
+        ``False`` and ``None``-in-real-time mean 'none'.
+        """
         if normalize is True or (normalize is None and self.imag_time):
             norm_mode = "orthonormalize"
         elif normalize is False or normalize is None:
@@ -1001,23 +1019,44 @@ class MCTDHF_n_species:
 
         if norm_mode not in ("orthonormalize", "normalize", "none"):
             raise ValueError(f"Unknown normalize option: {normalize}")
+        return norm_mode
+
+    def _make_norm_fn(self, norm_mode):
+        """The per-step renormalisation ``y → y``, or None for 'none'."""
+        if norm_mode == "none":
+            return None
+
+        def norm_fn(y):
+            C, bs = self._y_to_Cb(y)
+            if norm_mode == "orthonormalize":
+                C = self.ortonorm_C(C)
+                bs_new = [self.ortonorm_b(b) for b in bs]
+            else:
+                C = self.normalize_C(C)
+                bs_new = [self.normalize_b(b) for b in bs]
+            return self._Cb_to_y(C, bs_new)
+
+        return norm_fn
+
+    def _scan_integrate(self, integrator, y_init, t_init, num_steps,
+                        save_every, norm_fn=None):
+        """Run `num_steps` of `integrator`, saving every `save_every` steps.
+
+        Shared by the standard and ML solvers: the state layout enters only
+        through `norm_fn`, which the caller builds. Steps are scanned in
+        chunks of `save_every` so only the chunk ends are materialised; if
+        `num_steps` is not divisible by `save_every` the remainder is scanned
+        separately, so the final state is always included.
+
+        Returns ``(ts, ys)`` with the initial state prepended.
+        """
 
         @jit
         def step_fn(carry, _):
             t, y = carry
             t, y = integrator(t, y)
-
-            if norm_mode == "orthonormalize":
-                C, bs = self._y_to_Cb(y)
-                C = self.ortonorm_C(C)
-                bs_new = [self.ortonorm_b(b) for b in bs]
-                y = self._Cb_to_y(C, bs_new)
-            elif norm_mode == "normalize":
-                C, bs = self._y_to_Cb(y)
-                C = self.normalize_C(C)
-                bs_new = [self.normalize_b(b) for b in bs]
-                y = self._Cb_to_y(C, bs_new)
-
+            if norm_fn is not None:
+                y = norm_fn(y)
             return (t, y), None
 
         @jit
@@ -1029,6 +1068,8 @@ class MCTDHF_n_species:
 
         num_chunks = num_steps // save_every
         remainder = num_steps % save_every
+
+        t, y = t_init, y_init
 
         # Main scan: full chunks
         if num_chunks > 0:
@@ -1304,6 +1345,43 @@ class MCTDHF_n_species:
         return postprocessing.particle_densities(self, C, bs_list, spf_list)
 
     @partial(jit, static_argnums=0)
+    def _det_overlap_matrices(self, bs1, bs2):
+        """Determinant overlap matrices ``S^s_{IJ} = det(O^s[occ_I, occ_J])``.
+
+        ``O^s_{ij} = ⟨φ^1_i|φ^2_j⟩`` is the MO overlap between the two
+        orbital sets; the determinant overlap is the minor of ``O`` on the
+        occupied rows of ``I`` and columns of ``J``.
+
+        Factored out of :meth:`calculate_overlap` so ML-MCTDHF can reuse it
+        verbatim — there the determinant overlap is sandwiched between the
+        two SPF matrices (``S̃^s = B1_s† S^s B2_s``) before the top-tensor
+        contraction.
+
+        Returns one ``(D_s, D_s)`` matrix per species.
+        """
+        S_matrices = []
+        for s in range(self.num_species):
+            b1, b2 = bs1[s], bs2[s]
+            I = jnp.array(self.dCI.I[s])
+            n_dets = self.num_dets[s]
+            n_elec = self.num_particles[s]
+
+            # MO overlap O_{ij} = ⟨φ^1_i|φ^2_j⟩
+            O = contract("ki, kj -> ij", b1.conj(), b2, backend="jax")
+
+            # Extract occupied submatrices O[occ_I, occ_J] for each det pair (I, J)
+            Mask = contract("ai, bj -> abij", I, I, backend="jax")
+            Val = contract("ai, bj, ij -> abij", I, I, O, backend="jax")
+
+            expected_size = n_dets * n_dets * n_elec * n_elec
+            indices = jnp.nonzero(Mask.reshape(-1), size=expected_size)
+            elems = Val.reshape(-1)[indices]
+
+            mat = elems.reshape(n_dets, n_dets, n_elec, n_elec)
+            S_matrices.append(jnp.linalg.det(mat))
+        return S_matrices
+
+    @partial(jit, static_argnums=0)
     def calculate_overlap(self, y1, y2):
         """Calculate overlap ⟨Ψ₁|Ψ₂⟩ between two multi-species states.
 
@@ -1325,27 +1403,7 @@ class MCTDHF_n_species:
         C1, bs1 = self._y_to_Cb(y1)
         C2, bs2 = self._y_to_Cb(y2)
 
-        # Build determinant overlap matrices S_{IJ} = det(⟨φ^1_i|φ^2_j⟩) for each species
-        S_matrices = []
-        for s in range(self.num_species):
-            b1, b2 = bs1[s], bs2[s]
-            I = jnp.array(self.dCI.I[s])
-            n_dets = self.num_dets[s]
-            n_elec = self.num_particles[s]
-
-            # MO overlap O_{ij} = ⟨φ^1_i|φ^2_j⟩
-            O = contract("ki, kj -> ij", b1.conj(), b2, backend="jax")
-
-            # Extract occupied submatrices O[occ_I, occ_J] for each det pair (I, J)
-            Mask = contract("ai, bj -> abij", I, I, backend="jax")
-            Val = contract("ai, bj, ij -> abij", I, I, O, backend="jax")
-
-            expected_size = n_dets * n_dets * n_elec * n_elec
-            indices = jnp.nonzero(Mask.reshape(-1), size=expected_size)
-            elems = Val.reshape(-1)[indices]
-
-            mat = elems.reshape(n_dets, n_dets, n_elec, n_elec)
-            S_matrices.append(jnp.linalg.det(mat))
+        S_matrices = self._det_overlap_matrices(bs1, bs2)
 
         # Contract: ⟨Ψ₁|Ψ₂⟩ = C₁*_{s,a,b,...} · C₂_{s,d,e,...} · S⁰_{ad} · S¹_{be} · ...
         K = self.num_species

@@ -65,23 +65,15 @@ def test_m1_ite():
     
     # Setup New
     g_dict = {
-        (0,0): g, (1,1): g, (0,1): g # Add all 3? Or just (0,1)?
-        # 2-species (alpha, beta).
-        # Alpha-Alpha: 0 in M=1? No, 1 electron. No intra.
-        # Alpha-Beta: Yes.
-        # Beta-Alpha: Symmetric.
-        # Beta-Beta: No.
-        # But for generality passing all is fine (N=1 implies intra terms vanish or handle correctly).
+        (0,0): g, (1,1): g, (0,1): g
+        # Two species (alpha, beta) with one electron each: only the
+        # alpha-beta interaction acts.
     }
-    # MCTDHF constructor for old handles 'g' as spin-independent usually?
-    # Old code applies 'g' to all pairs implicitly via get_sigma.
-    # For N_alpha=1, N_beta=1, only alpha-beta interaction exists.
-    # So g_dict[(0,1)] is crucial.
+    # The two-spin code applies its single g to the alpha-beta pair.
     
     mctdhf_new = MCTDHF_n_species(
         h_list=[h, h],
-        g_dict={(0, 1): g}, # Pass only (0,1) to match old implicitly?
-                            # Old code takes single g. Applies to alpha-beta.
+        g_dict={(0, 1): g},  # the alpha-beta interaction, as in the two-spin code
         num_particles=[1, 1],
         num_mctdhf_orbitals=[1, 1],
         num_spatial_orbitals=[N_spatial, N_spatial],
@@ -117,9 +109,7 @@ def test_m1_ite():
         _, y_next_old = integrator_old(t, y_next_old)
         _, y_next_new = integrator_new(t, y_next_new)
         
-        # Normalize (Important for ITE)
-        # Old code integrate loop usually handles this? 
-        # But we use direct step here. Manually normalize b.
+        # Re-orthonormalise the orbitals after each Euler step (ITE).
         
         # Normalize Old
         C_o, ba_o, bb_o = mctdhf_old._y_to_Cb(y_next_old)

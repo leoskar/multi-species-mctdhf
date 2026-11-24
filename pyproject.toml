@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mctdhf-n-species"
-version = "0.7.3"
-description = "N-species MCTDHF calculations using JAX with semi-direct CI."
+name = "multi-species-mctdhf"
+version = "0.8.0"
+description = "Multi-species MCTDHF and ML-MCTDHF in JAX with semi-direct CI."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -26,9 +26,10 @@ dependencies = [
 adaptive = ["diffrax>=0.4"]
 cuda12 = ["jax[cuda12]"]
 cpu = ["jax[cpu]"]
+test = ["pytest>=7"]
 
 [project.urls]
-Repository = "https://github.com/leoskar/n-species-mctdh"
+Repository = "https://github.com/leoskar/multi-species-mctdhf"
 
 [tool.setuptools.packages.find]
 include = ["mctdhf*"]

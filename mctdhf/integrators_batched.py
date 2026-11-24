@@ -24,7 +24,7 @@ from the frozen b_s and is loop-invariant just like the off-diagonal blocks.
 
 Physics matches ``get_cmf_half_step_integrator(mctdh, dt, c_propagator="sil",
 b_propagator="sil")`` term for term; only the execution is reshaped. Verified
-against it in ``tests`` / scratchpad on the four-well system.
+against it on the four-well system.
 """
 
 import jax
