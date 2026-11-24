@@ -4,13 +4,17 @@ Multi-species multiconfiguration time-dependent Hartree–Fock (MCTDHF) and its
 multilayer form (ML-MCTDHF), written in [JAX](https://github.com/jax-ml/jax).
 
 The wavefunction is a sum of products of Slater determinants, one per
-**distinguishable species**. Each species has its own time-dependent orbitals and
-its own primitive (sine-DVR) basis, and antisymmetrisation acts only within a
+**distinguishable species**. Each species has its own time-dependent orbitals,
+expanded in its own primitive basis, and antisymmetrisation acts only within a
 species. The code was written to simulate gates in multi-qubit hardware, where each
 qubit is a separate species, but nothing in it is specific to that application.
 
 Features:
 
+- **Any orthonormal primitive basis.** The solvers take the one-body Hamiltonian
+  and the two-body integrals of each species as arrays. The `*_DVR` variants use
+  the diagonal two-body integrals of a DVR; `sine_dvr.py` provides a sine-DVR
+  basis.
 - **Semi-direct CI.** One- and two-particle excitation operators are precomputed
   per species, and the action of the Hamiltonian on the coefficient tensor is
   evaluated directly instead of forming the Hamiltonian matrix.
