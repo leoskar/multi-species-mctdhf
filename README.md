@@ -1,4 +1,4 @@
-# multi-species-mctdhf
+# Multi-species MCTDHF
 
 Multi-species multiconfiguration time-dependent Hartree–Fock (MCTDHF) and its
 multilayer form (ML-MCTDHF), written in [JAX](https://github.com/jax-ml/jax).
